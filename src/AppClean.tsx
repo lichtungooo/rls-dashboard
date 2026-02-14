@@ -13,6 +13,7 @@ import { ProfilWidget } from './widgets/ProfilWidget'
 import { KalenderWidget } from './widgets/KalenderWidget'
 import { FeedWidget } from './widgets/FeedWidget'
 import { WalletTile, SkillsTile, AvatarTile, LogTile } from './components/HUDTiles'
+import { generateTrustNetwork, TrustNetworkOverlay } from './components/TrustNetworkLayer'
 
 // Icon-Fix für Leaflet
 delete (L.Icon.Default.prototype as any)._getIconUrl
@@ -29,6 +30,7 @@ L.Icon.Default.mergeOptions({
 type ModuleId = 'profil' | 'kalender' | 'feed' | 'marktplatz' | 'quest' | 'wertschoepfung' | 'wallet' | 'skills' | 'avatar' | 'log'
 type TileSize = '1x1' | '2x1' | '1x2' | '2x2' | '3x1' | '3x2'
 type MapLayer = 'normal' | 'satellit' | 'fantasy'
+type TrustMode = 'all' | 'my'
 
 interface Tile {
   id: string
@@ -153,7 +155,6 @@ function TileHeader({
         <span className="text-xs text-gray-300 font-mono">{size}</span>
       </div>
       <div className="flex items-center gap-1">
-        {/* Resize Button */}
         <button
           onClick={onResize}
           title={isMax ? 'Verkleinern (1×1)' : `Vergrößern (${nextSize})`}
@@ -171,7 +172,6 @@ function TileHeader({
             </svg>
           )}
         </button>
-        {/* Schließen */}
         <button
           onClick={onClose}
           title="Kachel schließen"
@@ -187,6 +187,67 @@ function TileHeader({
 }
 
 // ============================================================
+// WEB OF TRUST — Info-Leiste (wenn aktiv)
+// ============================================================
+
+function TrustInfoBar({ mode, onModeChange, onClose }: {
+  mode: TrustMode
+  onModeChange: (m: TrustMode) => void
+  onClose: () => void
+}) {
+  return (
+    <div style={{
+      position: 'fixed',
+      top: 64,
+      left: '50%',
+      transform: 'translateX(-50%)',
+      zIndex: 60,
+    }}>
+      <FloatingCard padding="none" backgroundOpacity={97}>
+        <div className="flex items-center gap-1 px-3 py-2">
+          <span style={{ fontSize: '16px', marginRight: 4 }}>🕸️</span>
+          <span className="text-xs font-semibold text-gray-600 mr-2">Web of Trust</span>
+
+          <div className="flex rounded-lg overflow-hidden border border-gray-200">
+            <button
+              onClick={() => onModeChange('all')}
+              className="px-3 py-1 text-xs font-medium transition-all"
+              style={{
+                backgroundColor: mode === 'all' ? '#8b5cf6' : 'transparent',
+                color: mode === 'all' ? 'white' : '#6b7280',
+              }}
+            >
+              🌍 Alle (10.000)
+            </button>
+            <button
+              onClick={() => onModeChange('my')}
+              className="px-3 py-1 text-xs font-medium transition-all border-l border-gray-200"
+              style={{
+                backgroundColor: mode === 'my' ? '#f59e0b' : 'transparent',
+                color: mode === 'my' ? 'white' : '#6b7280',
+              }}
+            >
+              ⭐ Mein Netz
+            </button>
+          </div>
+
+          <span className="text-xs text-gray-400 ml-2 hidden sm:block">Zoom raus → dickere Verbindungen</span>
+
+          <button
+            onClick={onClose}
+            className="ml-2 w-6 h-6 rounded flex items-center justify-center hover:bg-red-50 text-gray-300 hover:text-red-400 transition-colors"
+          >
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+            </svg>
+          </button>
+        </div>
+      </FloatingCard>
+    </div>
+  )
+}
+
+// ============================================================
 // HAUPT APP
 // ============================================================
 
@@ -195,8 +256,8 @@ export default function App() {
   const mapInstanceRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const moduleScrollRef = useRef<HTMLDivElement>(null)
+  const trustOverlayRef = useRef<TrustNetworkOverlay | null>(null)
 
-  // Kacheln-State: Array von Tiles
   const [tiles, setTiles] = useState<Tile[]>([])
   const [spaceDropdownOpen, setSpaceDropdownOpen] = useState(false)
   const [quickActionsOpen, setQuickActionsOpen] = useState(false)
@@ -204,6 +265,10 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false)
   const [startX, setStartX] = useState(0)
   const [scrollLeft, setScrollLeft] = useState(0)
+
+  // Web of Trust State
+  const [trustActive, setTrustActive] = useState(false)
+  const [trustMode, setTrustMode] = useState<TrustMode>('all')
 
   // ────────────────────────────────────────────────────────
   // Leaflet Map Init
@@ -241,17 +306,48 @@ export default function App() {
   }, [])
 
   // ────────────────────────────────────────────────────────
+  // Web of Trust Overlay
+  // ────────────────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapInstanceRef.current
+    if (!map) return
+
+    if (trustActive) {
+      const nodes = generateTrustNetwork()
+      const overlay = new TrustNetworkOverlay(nodes, trustMode)
+      overlay.addTo(map)
+      trustOverlayRef.current = overlay
+      // Rauszoomen: globale Sicht
+      map.setView([30, 10], 3, { animate: true })
+    } else {
+      if (trustOverlayRef.current) {
+        map.removeLayer(trustOverlayRef.current)
+        trustOverlayRef.current = null
+      }
+      map.setView([52.52, 13.405], 13, { animate: true })
+    }
+  }, [trustActive]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Modus-Wechsel (alle / mein Netz)
+  useEffect(() => {
+    if (trustOverlayRef.current) {
+      trustOverlayRef.current.setMode(trustMode)
+      if (trustMode === 'my' && mapInstanceRef.current) {
+        mapInstanceRef.current.setView([52.52, 13.405], 6, { animate: true })
+      } else if (trustMode === 'all' && mapInstanceRef.current) {
+        mapInstanceRef.current.setView([30, 10], 3, { animate: true })
+      }
+    }
+  }, [trustMode])
+
+  // ────────────────────────────────────────────────────────
   // Kacheln-Management
   // ────────────────────────────────────────────────────────
-
-  // Modul öffnen/schließen: Kachel hinzufügen oder entfernen
   const openModule = useCallback((moduleId: ModuleId) => {
     setTiles(prev => {
-      // Bereits offen? → schließen
       if (prev.find(t => t.moduleId === moduleId)) {
         return prev.filter(t => t.moduleId !== moduleId)
       }
-      // Neu hinzufügen als 1×1
       return [...prev, {
         id: `${moduleId}-${Date.now()}`,
         moduleId,
@@ -290,10 +386,7 @@ export default function App() {
     setActiveMapLayer(layerKey)
   }
 
-  // Hashtag → Karte zeigen (Kacheln schließen sich nicht, Karte liegt drunter)
-  const handleHashtagClick = (_tag: string, _category: 'offer' | 'need') => {
-    // Karte ist immer im Hintergrund, nichts schließen nötig
-  }
+  const handleHashtagClick = (_tag: string, _category: 'offer' | 'need') => {}
 
   // ────────────────────────────────────────────────────────
   // Drag-to-scroll Module Nav
@@ -318,10 +411,6 @@ export default function App() {
     moduleScrollRef.current.scrollBy({ left: direction === 'left' ? -200 : 200, behavior: 'smooth' })
   }
 
-  // ────────────────────────────────────────────────────────
-  // Grid-Rendering
-  // Strategie: Tiles haben col/row-Spans, CSS Grid auto-placement
-  // ────────────────────────────────────────────────────────
   const hasTiles = tiles.length > 0
 
   return (
@@ -412,8 +501,32 @@ export default function App() {
         </FloatingCard>
       </div>
 
-      {/* === TOP RIGHT: Settings === */}
+      {/* === TOP RIGHT: Web of Trust + Dark Mode + Login === */}
       <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 50, display: 'flex', gap: 6, height: '40px' }}>
+
+        {/* Web of Trust Button */}
+        <FloatingCard padding="none" backgroundOpacity={95}>
+          <button
+            onClick={() => setTrustActive(v => !v)}
+            className="h-full px-2.5 hover:bg-gray-50 rounded-lg transition-all flex items-center gap-2"
+            title="Web of Trust anzeigen"
+            style={{ backgroundColor: trustActive ? 'rgba(139, 92, 246, 0.12)' : 'transparent' }}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={trustActive ? '#8b5cf6' : '#4b5563'} strokeWidth="2">
+              <circle cx="12" cy="5" r="2"/>
+              <circle cx="4" cy="19" r="2"/>
+              <circle cx="20" cy="19" r="2"/>
+              <line x1="12" y1="7" x2="4" y2="17"/>
+              <line x1="12" y1="7" x2="20" y2="17"/>
+              <line x1="4" y1="19" x2="20" y2="19"/>
+            </svg>
+            {trustActive && (
+              <span className="text-xs font-semibold" style={{ color: '#8b5cf6' }}>Netz</span>
+            )}
+          </button>
+        </FloatingCard>
+
+        {/* Dark Mode */}
         <FloatingCard padding="none" backgroundOpacity={95}>
           <button className="h-full px-2.5 hover:bg-gray-50 rounded-lg transition-colors flex items-center" title="Dark Mode">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-600">
@@ -421,6 +534,8 @@ export default function App() {
             </svg>
           </button>
         </FloatingCard>
+
+        {/* Login */}
         <FloatingCard padding="none" backgroundOpacity={95}>
           <button className="h-full flex items-center gap-2 px-3 hover:bg-gray-50 rounded-lg transition-colors">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-600">
@@ -431,6 +546,15 @@ export default function App() {
           </button>
         </FloatingCard>
       </div>
+
+      {/* === WEB OF TRUST INFO-LEISTE === */}
+      {trustActive && (
+        <TrustInfoBar
+          mode={trustMode}
+          onModeChange={setTrustMode}
+          onClose={() => setTrustActive(false)}
+        />
+      )}
 
       {/* === LEFT CENTER: Zoom Controls === */}
       <div style={{ position: 'fixed', left: 12, top: '50%', transform: 'translateY(-50%)', zIndex: 50 }}>
@@ -525,7 +649,6 @@ export default function App() {
             right: 60,
             bottom: 88,
             zIndex: 20,
-            // CSS Grid: 3 Spalten, 2 Reihen, auto-fit
             display: 'grid',
             gridTemplateColumns: 'repeat(3, 1fr)',
             gridTemplateRows: 'repeat(2, 1fr)',
