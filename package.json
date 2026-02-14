@@ -11,9 +11,7 @@
   "dependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "react-grid-layout": "^1.4.4",
     "leaflet": "^1.9.4",
-    "react-leaflet": "^4.2.1",
     "clsx": "^2.1.1"
   },
   "devDependencies": {
