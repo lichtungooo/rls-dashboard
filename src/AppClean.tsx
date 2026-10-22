@@ -1,19 +1,28 @@
 /**
  * Clean Dashboard - Map + dynamisches Kachel-System
- * Kacheln öffnen sich von Modul-Nav (oben) und Player HUD (unten)
- * Jede Kachel: schließen + resize (1×1, 2×1, 1×2, 3×2)
+ * Grid: 12 Spalten, unbegrenzt nach unten (scrollbar)
+ * Kacheln: Drag & Drop, frei skalierbar, Vollbild, Lock/Unlock
+ * Jede Kachel: Vollbild-Button + Schließen in Title Bar
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
+import RGL from 'react-grid-layout'
+import 'react-grid-layout/css/styles.css'
+// Cast to any to avoid type issues with export= pattern
+const GridLayout = RGL as any
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import 'leaflet.markercluster/dist/MarkerCluster.css'
+import 'leaflet.markercluster/dist/MarkerCluster.Default.css'
 import { FloatingCard } from './components/FloatingCard'
 import { PlayerHUD } from './components/PlayerHUD'
 import { ProfilWidget } from './widgets/ProfilWidget'
 import { KalenderWidget } from './widgets/KalenderWidget'
 import { FeedWidget } from './widgets/FeedWidget'
 import { WalletTile, SkillsTile, AvatarTile, LogTile } from './components/HUDTiles'
-import { generateTrustNetwork, TrustNetworkOverlay } from './components/TrustNetworkLayer'
+import { createTrustOverlay } from './components/TrustNetworkLayer'
+import { GlobeView } from './components/GlobeView'
+import { EliMascot } from './components/EliMascot'
 
 // Icon-Fix für Leaflet
 delete (L.Icon.Default.prototype as any)._getIconUrl
@@ -27,56 +36,59 @@ L.Icon.Default.mergeOptions({
 // TYPEN
 // ============================================================
 
-type ModuleId = 'profil' | 'kalender' | 'feed' | 'marktplatz' | 'quest' | 'wertschoepfung' | 'wallet' | 'skills' | 'avatar' | 'log'
-type TileSize = '1x1' | '2x1' | '1x2' | '2x2' | '3x1' | '3x2'
-type MapLayer = 'normal' | 'satellit' | 'fantasy'
+type ModuleId =
+  | 'profil' | 'kalender' | 'marktplatz' | 'wertschoepfung' | 'quest'
+  | 'avatar' | 'skilltree' | 'log' | 'feed'
+  | 'entscheidung' | 'wissensdatenbank' | 'eli' | 'health' | 'notifications'
+  | 'wallet'
+type MapLayer = 'normal' | 'satellit' | 'fantasy' | 'globe'
 type TrustMode = 'all' | 'my'
+
+// Grid-Layout Typen
+interface GridItem { i: string; x: number; y: number; w: number; h: number; minW?: number; minH?: number; maxW?: number; maxH?: number }
+interface GridLayouts { lg: GridItem[] }
 
 interface Tile {
   id: string
   moduleId: ModuleId
-  size: TileSize
 }
 
-// colspan und rowspan pro Größe
-const TILE_SPAN: Record<TileSize, { col: number; row: number }> = {
-  '1x1': { col: 1, row: 1 },
-  '2x1': { col: 2, row: 1 },
-  '1x2': { col: 1, row: 2 },
-  '2x2': { col: 2, row: 2 },
-  '3x1': { col: 3, row: 1 },
-  '3x2': { col: 3, row: 2 },
-}
+// Grid: 12 Spalten, unbegrenzte Zeilen (scrollbar)
+const GRID_COLS = 12
 
-// Nächste Größe beim Vergrößern
-const NEXT_SIZE: Record<TileSize, TileSize> = {
-  '1x1': '2x1',
-  '2x1': '2x2',
-  '1x2': '2x2',
-  '2x2': '3x2',
-  '3x1': '3x2',
-  '3x2': '1x1',
-}
-
-// Module-Metadaten
+// Module-Metadaten (alle 14 Module aus module-und-komponenten.md)
 const MODULE_META: Record<ModuleId, { label: string; icon: string }> = {
-  profil:        { label: 'Profil',        icon: '👤' },
-  kalender:      { label: 'Kalender',      icon: '📅' },
-  feed:          { label: 'Feed',          icon: '📰' },
-  marktplatz:    { label: 'Marktplatz',    icon: '🛒' },
-  quest:         { label: 'Quest',         icon: '⚔️' },
-  wertschoepfung:{ label: 'Money',         icon: '💎' },
-  wallet:        { label: 'Wallet',        icon: '💳' },
-  skills:        { label: 'Fähigkeiten',   icon: '✦' },
-  avatar:        { label: 'Avatar',        icon: '🎭' },
-  log:           { label: 'Log',           icon: '📄' },
+  // Kern-Module
+  profil:          { label: 'Profil',          icon: '👤' },
+  kalender:        { label: 'Kalender',        icon: '📅' },
+  marktplatz:      { label: 'Marktplatz',      icon: '🛒' },
+  wertschoepfung:  { label: 'Wertschöpfung',   icon: '💎' },
+  // Gamification
+  quest:           { label: 'Quest',           icon: '⚔️' },
+  avatar:          { label: 'Avatar',          icon: '🎭' },
+  skilltree:       { label: 'Skill-Tree',      icon: '🌳' },
+  log:             { label: 'Log',             icon: '📄' },
+  // Social
+  feed:            { label: 'Feed',            icon: '📰' },
+  // Erweitert
+  entscheidung:    { label: 'Entscheidung',    icon: '🗳️' },
+  wissensdatenbank:{ label: 'Wissen',          icon: '📚' },
+  eli:             { label: 'Eli',             icon: '🦉' },
+  health:          { label: 'Health',          icon: '🌿' },
+  notifications:   { label: 'Benachrichtigung',icon: '🔔' },
+  // HUD-Module
+  wallet:          { label: 'Wallet',          icon: '💳' },
 }
 
-// Top-Navigation Module
-const NAV_MODULES: ModuleId[] = ['kalender', 'marktplatz', 'profil', 'quest', 'wertschoepfung', 'feed']
+// Top-Navigation Module (Haupt-Module in der oberen Leiste)
+const NAV_MODULES: ModuleId[] = [
+  'profil', 'kalender', 'marktplatz', 'quest', 'wertschoepfung',
+  'feed', 'skilltree', 'avatar', 'log',
+  'entscheidung', 'wissensdatenbank', 'eli', 'health', 'notifications',
+]
 
-// Kartenlagen
-const MAP_LAYERS: Record<MapLayer, { url: string; attribution: string; maxZoom: number; label: string; icon: string; cssFilter?: string }> = {
+// Kartenlagen (Tile-basierte Karten)
+const TILE_LAYERS: Record<string, { url: string; attribution: string; maxZoom: number; label: string; icon: string; cssFilter?: string }> = {
   normal: {
     url: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
     attribution: '&copy; OpenStreetMap contributors',
@@ -101,6 +113,14 @@ const MAP_LAYERS: Record<MapLayer, { url: string; attribution: string; maxZoom: 
   },
 }
 
+// Alle Ansichts-Modi (inkl. 3D-Globus)
+const ALL_LAYERS: { key: MapLayer; label: string; icon: string }[] = [
+  { key: 'normal',   label: 'Normal',   icon: '🗺️' },
+  { key: 'satellit', label: 'Satellit', icon: '🛰️' },
+  { key: 'fantasy',  label: 'Fantasy',  icon: '🧙' },
+  { key: 'globe',    label: '3D',       icon: '🌍' },
+]
+
 // ============================================================
 // KACHEL-INHALT
 // ============================================================
@@ -111,7 +131,7 @@ function TileContent({ moduleId, onHashtagClick }: { moduleId: ModuleId; onHasht
     case 'kalender': return <KalenderWidget />
     case 'feed':     return <FeedWidget />
     case 'wallet':   return <WalletTile />
-    case 'skills':   return <SkillsTile />
+    case 'skilltree': return <SkillsTile />
     case 'avatar':   return <AvatarTile />
     case 'log':      return <LogTile />
     default:
@@ -126,58 +146,55 @@ function TileContent({ moduleId, onHashtagClick }: { moduleId: ModuleId; onHasht
 }
 
 // ============================================================
-// KACHEL-KOPFZEILE (Titel + Resize + Schließen)
+// KACHEL-KOPFZEILE (minimaler Drag-Handle + Schließen)
 // ============================================================
 
 function TileHeader({
   moduleId,
-  size,
-  onResize,
   onClose,
+  onFullscreen,
+  isFullscreen,
 }: {
   moduleId: ModuleId
-  size: TileSize
-  onResize: () => void
   onClose: () => void
+  onFullscreen: () => void
+  isFullscreen: boolean
 }) {
   const meta = MODULE_META[moduleId]
-  const nextSize = NEXT_SIZE[size]
-  const isMax = size === '3x2'
 
   return (
     <div
-      className="flex items-center justify-between px-3 py-2 border-b border-gray-100 flex-shrink-0"
-      style={{ backgroundColor: 'rgba(255,255,255,0.7)' }}
+      className="tile-drag-handle flex items-center justify-between px-2.5 py-1 border-b border-gray-100/50 flex-shrink-0"
+      style={{ backgroundColor: 'rgba(249,250,251,0.6)', cursor: isFullscreen ? 'default' : 'move', minHeight: 28 }}
     >
-      <div className="flex items-center gap-2">
-        <span style={{ fontSize: '14px' }}>{meta.icon}</span>
-        <span className="text-xs font-semibold text-gray-700">{meta.label}</span>
-        <span className="text-xs text-gray-300 font-mono">{size}</span>
+      <div className="flex items-center gap-1.5">
+        <span style={{ fontSize: '11px' }}>{meta.icon}</span>
+        <span className="text-[10px] font-semibold text-gray-500">{meta.label}</span>
       </div>
-      <div className="flex items-center gap-1">
+      <div className="flex items-center gap-0.5">
         <button
-          onClick={onResize}
-          title={isMax ? 'Verkleinern (1×1)' : `Vergrößern (${nextSize})`}
-          className="w-6 h-6 rounded flex items-center justify-center hover:bg-gray-100 transition-colors text-gray-400 hover:text-gray-600"
+          onClick={onFullscreen}
+          onMouseDown={e => e.stopPropagation()}
+          title={isFullscreen ? 'Vollbild beenden (ESC)' : 'Vollbild'}
+          className="w-5 h-5 rounded flex items-center justify-center hover:bg-blue-50 transition-colors text-gray-300 hover:text-blue-500"
         >
-          {isMax ? (
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <polyline points="4 14 10 14 10 20"/><polyline points="20 10 14 10 14 4"/>
-              <line x1="10" y1="14" x2="21" y2="3"/><line x1="3" y1="21" x2="14" y2="10"/>
+          {isFullscreen ? (
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>
             </svg>
           ) : (
-            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
-              <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+            <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
             </svg>
           )}
         </button>
         <button
           onClick={onClose}
-          title="Kachel schließen"
-          className="w-6 h-6 rounded flex items-center justify-center hover:bg-red-50 transition-colors text-gray-300 hover:text-red-400"
+          onMouseDown={e => e.stopPropagation()}
+          title="Schließen"
+          className="w-5 h-5 rounded flex items-center justify-center hover:bg-red-50 transition-colors text-gray-300 hover:text-red-400"
         >
-          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+          <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
             <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
           </svg>
         </button>
@@ -256,9 +273,13 @@ export default function App() {
   const mapInstanceRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const moduleScrollRef = useRef<HTMLDivElement>(null)
-  const trustOverlayRef = useRef<TrustNetworkOverlay | null>(null)
-
+  const trustOverlayRef = useRef<{ remove: () => void } | null>(null)
   const [tiles, setTiles] = useState<Tile[]>([])
+  const [gridLayouts, setGridLayouts] = useState<GridLayouts>({ lg: [] })
+  const [layoutLocked, setLayoutLocked] = useState(false)
+  // Dashboard ein/ausblenden (Layout bleibt gespeichert)
+  const [dashboardVisible, setDashboardVisible] = useState(true)
+  const savedDashboardRef = useRef<{ tiles: Tile[], layouts: GridLayouts } | null>(null)
   const [spaceDropdownOpen, setSpaceDropdownOpen] = useState(false)
   const [quickActionsOpen, setQuickActionsOpen] = useState(false)
   const [activeMapLayer, setActiveMapLayer] = useState<MapLayer>('normal')
@@ -269,6 +290,9 @@ export default function App() {
   // Web of Trust State
   const [trustActive, setTrustActive] = useState(false)
   const [trustMode, setTrustMode] = useState<TrustMode>('all')
+
+  // Tour-Highlight (welches UI-Element gerade hervorgehoben wird)
+  const [highlightTarget, setHighlightTarget] = useState<string | null>(null)
 
   // ────────────────────────────────────────────────────────
   // Leaflet Map Init
@@ -285,19 +309,22 @@ export default function App() {
         zoom: 13,
         zoomControl: false,
       })
-      const layer = MAP_LAYERS.normal
+      const layer = TILE_LAYERS.normal
       const tileLayer = L.tileLayer(layer.url, { attribution: layer.attribution, maxZoom: layer.maxZoom })
       tileLayer.addTo(map)
       tileLayerRef.current = tileLayer
-      L.marker([52.52, 13.405]).addTo(map).bindPopup('<strong>🗺️ Real Life Stack</strong><br/>Community-Zentrale')
-      L.marker([52.51, 13.38]).addTo(map).bindPopup('<strong>🌱 Gemeinschaftsgarten</strong><br/>Urban Gardening Treffpunkt')
-      L.marker([52.53, 13.42]).addTo(map).bindPopup('<strong>🔧 Repair Café</strong><br/>Jeden Samstag 14-18 Uhr')
       mapInstanceRef.current = map
+      // Trust-Pins IMMER auf der Karte anzeigen (echte anklickbare Marker)
+      trustOverlayRef.current = createTrustOverlay(map)
       setTimeout(() => { map.invalidateSize() }, 200)
     } catch (error) {
       console.error('❌ Error initializing map:', error)
     }
     return () => {
+      if (trustOverlayRef.current) {
+        trustOverlayRef.current.remove()
+        trustOverlayRef.current = null
+      }
       if (mapInstanceRef.current) {
         mapInstanceRef.current.remove()
         mapInstanceRef.current = null
@@ -305,76 +332,147 @@ export default function App() {
     }
   }, [])
 
-  // ────────────────────────────────────────────────────────
-  // Web of Trust Overlay
-  // ────────────────────────────────────────────────────────
-  useEffect(() => {
-    const map = mapInstanceRef.current
-    if (!map) return
-
-    if (trustActive) {
-      const nodes = generateTrustNetwork()
-      const overlay = new TrustNetworkOverlay(nodes, trustMode)
-      overlay.addTo(map)
-      trustOverlayRef.current = overlay
-      // Rauszoomen: globale Sicht
-      map.setView([30, 10], 3, { animate: true })
-    } else {
-      if (trustOverlayRef.current) {
-        map.removeLayer(trustOverlayRef.current)
-        trustOverlayRef.current = null
-      }
-      map.setView([52.52, 13.405], 13, { animate: true })
-    }
-  }, [trustActive]) // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Modus-Wechsel (alle / mein Netz)
-  useEffect(() => {
-    if (trustOverlayRef.current) {
-      trustOverlayRef.current.setMode(trustMode)
-      if (trustMode === 'my' && mapInstanceRef.current) {
-        mapInstanceRef.current.setView([52.52, 13.405], 6, { animate: true })
-      } else if (trustMode === 'all' && mapInstanceRef.current) {
-        mapInstanceRef.current.setView([30, 10], 3, { animate: true })
-      }
-    }
-  }, [trustMode])
+  // Web of Trust: Pins sind IMMER auf der Leaflet-Karte (echte MarkerCluster).
+  // Der 3D-Globus ist eine optionale Zusatzansicht.
 
   // ────────────────────────────────────────────────────────
   // Kacheln-Management
   // ────────────────────────────────────────────────────────
+  // Startgröße für neue Kacheln
+  const TILE_START_W = 2
+  const TILE_START_H = 2
+
+  // Nächste freie Grid-Position finden (links→rechts, dann nächste Reihe)
+  const findNextFreeSlot = useCallback((currentLayouts: GridItem[], w: number, h: number): { x: number; y: number } => {
+    const occupied = new Set<string>()
+    for (const l of currentLayouts) {
+      for (let dx = 0; dx < l.w; dx++) {
+        for (let dy = 0; dy < l.h; dy++) {
+          occupied.add(`${l.x + dx},${l.y + dy}`)
+        }
+      }
+    }
+    // Links→rechts, dann nächste Reihe (unbegrenzt nach unten)
+    for (let y = 0; y < 100; y++) {
+      for (let x = 0; x <= GRID_COLS - w; x++) {
+        let fits = true
+        for (let dx = 0; dx < w && fits; dx++) {
+          for (let dy = 0; dy < h && fits; dy++) {
+            if (occupied.has(`${x + dx},${y + dy}`)) fits = false
+          }
+        }
+        if (fits) return { x, y }
+      }
+    }
+    const maxY = currentLayouts.reduce((max, l) => Math.max(max, l.y + l.h), 0)
+    return { x: 0, y: maxY }
+  }, [])
+
+  // Vollbild: GESAMTES Layout speichern + nur das eine Tile anzeigen
+  const [fullscreenTileId, setFullscreenTileId] = useState<string | null>(null)
+  const preFullscreenLayoutRef = useRef<GridItem[]>([])
+
   const openModule = useCallback((moduleId: ModuleId) => {
+    // Wenn im Vollbild: erstmal ignorieren
+    if (fullscreenTileId) return
     setTiles(prev => {
       if (prev.find(t => t.moduleId === moduleId)) {
+        // Toggle: Modul schließen
+        setGridLayouts(gl => ({
+          lg: gl.lg.filter(l => !l.i.startsWith(moduleId + '-'))
+        }))
         return prev.filter(t => t.moduleId !== moduleId)
       }
-      return [...prev, {
-        id: `${moduleId}-${Date.now()}`,
-        moduleId,
-        size: '1x1',
-      }]
+      const id = `${moduleId}-${Date.now()}`
+      setGridLayouts(gl => {
+        const pos = findNextFreeSlot(gl.lg, TILE_START_W, TILE_START_H)
+        return { lg: [...gl.lg, { i: id, x: pos.x, y: pos.y, w: TILE_START_W, h: TILE_START_H, minW: 1, minH: 1, maxW: GRID_COLS, maxH: 6 }] }
+      })
+      return [...prev, { id, moduleId }]
     })
-  }, [])
+  }, [findNextFreeSlot, fullscreenTileId])
 
   const closeTile = useCallback((id: string) => {
+    if (fullscreenTileId === id) {
+      // Aus Vollbild raus und schließen
+      setFullscreenTileId(null)
+      setGridLayouts({ lg: preFullscreenLayoutRef.current.filter(l => l.i !== id) })
+      preFullscreenLayoutRef.current = []
+    } else {
+      setGridLayouts(gl => ({ lg: gl.lg.filter(l => l.i !== id) }))
+    }
     setTiles(prev => prev.filter(t => t.id !== id))
-  }, [])
+  }, [fullscreenTileId])
 
-  const resizeTile = useCallback((id: string) => {
-    setTiles(prev => prev.map(t =>
-      t.id === id ? { ...t, size: NEXT_SIZE[t.size] } : t
-    ))
+  // Vollbild: Gesamtes Layout speichern, nur das eine Tile auf 12x6 setzen
+  const toggleFullscreen = useCallback((id: string) => {
+    if (fullscreenTileId === id) {
+      // Zurück: Gesamtes Layout wiederherstellen
+      setGridLayouts({ lg: preFullscreenLayoutRef.current })
+      preFullscreenLayoutRef.current = []
+      setFullscreenTileId(null)
+    } else {
+      // Vorher: Gesamtes Layout sichern
+      setGridLayouts(gl => {
+        preFullscreenLayoutRef.current = gl.lg.map(l => ({ ...l }))
+        // Nur das eine Tile, maximal groß
+        return { lg: [{ i: id, x: 0, y: 0, w: GRID_COLS, h: 6, minW: 1, minH: 1, maxW: GRID_COLS, maxH: 6 }] }
+      })
+      setFullscreenTileId(id)
+    }
+  }, [fullscreenTileId])
+
+  // ESC zum Beenden von Vollbild
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && fullscreenTileId) {
+        toggleFullscreen(fullscreenTileId)
+      }
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [fullscreenTileId, toggleFullscreen])
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleLayoutChange = useCallback((layout: any) => {
+    setGridLayouts({ lg: layout })
   }, [])
 
   const isModuleOpen = (moduleId: ModuleId) => tiles.some(t => t.moduleId === moduleId)
+
+  const hasTiles = tiles.length > 0 || fullscreenTileId !== null
+
+  // Dashboard schließen (Layout merken) und wiederherstellen
+  const closeDashboard = useCallback(() => {
+    savedDashboardRef.current = { tiles: [...tiles], layouts: { lg: [...gridLayouts.lg] } }
+    setTiles([])
+    setGridLayouts({ lg: [] })
+    setDashboardVisible(false)
+  }, [tiles, gridLayouts])
+
+  const reopenDashboard = useCallback(() => {
+    if (savedDashboardRef.current) {
+      setTiles(savedDashboardRef.current.tiles)
+      setGridLayouts(savedDashboardRef.current.layouts)
+      savedDashboardRef.current = null
+    }
+    setDashboardVisible(true)
+  }, [])
 
   // ────────────────────────────────────────────────────────
   // Karten-Layer wechseln
   // ────────────────────────────────────────────────────────
   const switchMapLayer = (layerKey: MapLayer) => {
+    if (layerKey === 'globe') {
+      // 3D-Globus: Leaflet-Karte bleibt im Hintergrund, Globus wird darüber gelegt
+      setActiveMapLayer('globe')
+      return
+    }
+    // Tile-basierte Karten
     if (!mapInstanceRef.current) return
     const map = mapInstanceRef.current
-    const layerConfig = MAP_LAYERS[layerKey]
+    const layerConfig = TILE_LAYERS[layerKey]
+    if (!layerConfig) return
     if (tileLayerRef.current) map.removeLayer(tileLayerRef.current)
     const newLayer = L.tileLayer(layerConfig.url, {
       attribution: layerConfig.attribution,
@@ -411,14 +509,25 @@ export default function App() {
     moduleScrollRef.current.scrollBy({ left: direction === 'left' ? -200 : 200, behavior: 'smooth' })
   }
 
-  const hasTiles = tiles.length > 0
+  // Tour-Highlight-Style (pulsierender Glow)
+  const highlightStyle: React.CSSProperties = {
+    boxShadow: '0 0 0 3px rgba(139, 92, 246, 0.5), 0 0 20px rgba(139, 92, 246, 0.3)',
+    borderRadius: 12,
+    animation: 'tour-pulse 1.5s ease-in-out infinite',
+  }
 
   return (
     <>
-      {/* Leaflet-Karte Hintergrund */}
-      <div style={{ position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', zIndex: 0 }}>
+      {/* Leaflet-Karte Hintergrund (versteckt wenn 3D-Globus aktiv) */}
+      <div style={{
+        position: 'fixed', top: 0, left: 0, width: '100vw', height: '100vh', zIndex: 0,
+        display: activeMapLayer === 'globe' ? 'none' : 'block',
+      }}>
         <div ref={mapRef} style={{ height: '100%', width: '100%' }} />
       </div>
+
+      {/* 3D-Globus (gleiche Pins, andere Darstellung) */}
+      <GlobeView visible={activeMapLayer === 'globe'} mode={trustActive && trustMode === 'my' ? 'my' : 'all'} />
 
       {/* === TOP LEFT: Space Selector + Search === */}
       <div style={{ position: 'fixed', top: 12, left: 12, zIndex: 50, display: 'flex', gap: 6, height: '40px' }}>
@@ -461,7 +570,7 @@ export default function App() {
       </div>
 
       {/* === TOP CENTER: Module Navigation === */}
-      <div style={{ position: 'fixed', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 50, maxWidth: '560px' }}>
+      <div data-tour="nav-modules" style={{ position: 'fixed', top: 12, left: '50%', transform: 'translateX(-50%)', zIndex: 50, maxWidth: '560px', ...(highlightTarget === 'nav-modules' ? highlightStyle : {}) }}>
         <FloatingCard padding="none" backgroundOpacity={95}>
           <div className="flex items-center" style={{ height: '40px' }}>
             <button onClick={() => scrollModules('left')} className="px-2 py-2 hover:bg-gray-50 transition-colors flex items-center justify-center" style={{ height: '100%' }}>
@@ -501,14 +610,75 @@ export default function App() {
         </FloatingCard>
       </div>
 
-      {/* === TOP RIGHT: Web of Trust + Dark Mode + Login === */}
+      {/* === TOP RIGHT: Lock, Dashboard, Netz, Dark Mode, Login === */}
       <div style={{ position: 'fixed', top: 12, right: 12, zIndex: 50, display: 'flex', gap: 6, height: '40px' }}>
 
-        {/* Web of Trust Button */}
+        {/* 1. Layout Lock/Unlock */}
+        <FloatingCard padding="none" backgroundOpacity={95}>
+          <button
+            onClick={() => setLayoutLocked(l => !l)}
+            className="h-full flex items-center gap-2 px-3 hover:bg-gray-50 rounded-lg transition-colors"
+            title={layoutLocked ? 'Layout entsperren' : 'Layout fixieren'}
+            style={{ backgroundColor: layoutLocked ? 'rgba(245, 158, 11, 0.12)' : 'transparent' }}
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={layoutLocked ? '#f59e0b' : '#4b5563'} strokeWidth="2">
+              {layoutLocked ? (
+                <>
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </>
+              ) : (
+                <>
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                  <path d="M7 11V7a5 5 0 0 1 9.9-1"/>
+                </>
+              )}
+            </svg>
+            <span className="font-medium text-sm" style={{ color: layoutLocked ? '#f59e0b' : '#6b7280' }}>
+              {layoutLocked ? 'Fixiert' : 'Frei'}
+            </span>
+          </button>
+        </FloatingCard>
+
+        {/* 2. Dashboard ein/aus */}
+        <FloatingCard padding="none" backgroundOpacity={95}>
+          {hasTiles && dashboardVisible ? (
+            <button
+              onClick={closeDashboard}
+              className="h-full flex items-center gap-2 px-3 hover:bg-red-50 rounded-lg transition-colors"
+              title="Dashboard schließen (Layout bleibt gespeichert)"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#4b5563" strokeWidth="2">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+              </svg>
+              <span className="font-medium text-sm text-gray-600">Dashboard</span>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-gray-400">
+                <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+              </svg>
+            </button>
+          ) : (
+            <button
+              onClick={savedDashboardRef.current ? reopenDashboard : undefined}
+              className="h-full flex items-center gap-2 px-3 hover:bg-blue-50 rounded-lg transition-colors"
+              title={savedDashboardRef.current ? 'Dashboard wiederherstellen' : 'Kein gespeichertes Dashboard'}
+              style={{ opacity: savedDashboardRef.current ? 1 : 0.4 }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke={savedDashboardRef.current ? '#3b82f6' : '#9ca3af'} strokeWidth="2">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+                <rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>
+              </svg>
+              <span className="font-medium text-sm" style={{ color: savedDashboardRef.current ? '#3b82f6' : '#9ca3af' }}>Dashboard</span>
+            </button>
+          )}
+        </FloatingCard>
+
+        {/* 3. Web of Trust / Netz */}
+        <div data-tour="trust-button" style={highlightTarget === 'trust-button' ? { ...highlightStyle, borderRadius: 10 } : {}}>
         <FloatingCard padding="none" backgroundOpacity={95}>
           <button
             onClick={() => setTrustActive(v => !v)}
-            className="h-full px-2.5 hover:bg-gray-50 rounded-lg transition-all flex items-center gap-2"
+            className="h-full flex items-center gap-2 px-3 hover:bg-gray-50 rounded-lg transition-all"
             title="Web of Trust anzeigen"
             style={{ backgroundColor: trustActive ? 'rgba(139, 92, 246, 0.12)' : 'transparent' }}
           >
@@ -520,29 +690,28 @@ export default function App() {
               <line x1="12" y1="7" x2="20" y2="17"/>
               <line x1="4" y1="19" x2="20" y2="19"/>
             </svg>
-            {trustActive && (
-              <span className="text-xs font-semibold" style={{ color: '#8b5cf6' }}>Netz</span>
-            )}
+            <span className="font-medium text-sm" style={{ color: trustActive ? '#8b5cf6' : '#6b7280' }}>Netz</span>
           </button>
         </FloatingCard>
+        </div>
 
-        {/* Dark Mode */}
+        {/* 4. Dark Mode */}
         <FloatingCard padding="none" backgroundOpacity={95}>
-          <button className="h-full px-2.5 hover:bg-gray-50 rounded-lg transition-colors flex items-center" title="Dark Mode">
+          <button className="h-full flex items-center gap-2 px-3 hover:bg-gray-50 rounded-lg transition-colors" title="Dark Mode">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-600">
               <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
             </svg>
           </button>
         </FloatingCard>
 
-        {/* Login */}
+        {/* 5. Login */}
         <FloatingCard padding="none" backgroundOpacity={95}>
           <button className="h-full flex items-center gap-2 px-3 hover:bg-gray-50 rounded-lg transition-colors">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-gray-600">
               <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
               <circle cx="12" cy="7" r="4"/>
             </svg>
-            <span className="font-medium text-gray-700 text-xs">Login</span>
+            <span className="font-medium text-gray-700 text-sm">Login</span>
           </button>
         </FloatingCard>
       </div>
@@ -574,19 +743,18 @@ export default function App() {
         </FloatingCard>
       </div>
 
-      {/* === RIGHT CENTER: Layer Switcher === */}
-      <div style={{ position: 'fixed', right: 12, top: '50%', transform: 'translateY(-50%)', zIndex: 50 }}>
+      {/* === RIGHT CENTER: Layer Switcher (immer sichtbar) === */}
+      <div data-tour="layer-switcher" style={{ position: 'fixed', right: 12, top: '50%', transform: 'translateY(-50%)', zIndex: 50, ...(highlightTarget === 'layer-switcher' ? highlightStyle : {}) }}>
         <FloatingCard padding="none" backgroundOpacity={95}>
           <div className="flex flex-col">
-            {(Object.keys(MAP_LAYERS) as MapLayer[]).map((layerKey, idx, arr) => {
-              const layer = MAP_LAYERS[layerKey]
-              const isActive = activeMapLayer === layerKey
+            {ALL_LAYERS.map((layer, idx) => {
+              const isActive = activeMapLayer === layer.key
               return (
                 <button
-                  key={layerKey}
-                  onClick={() => switchMapLayer(layerKey)}
+                  key={layer.key}
+                  onClick={() => switchMapLayer(layer.key)}
                   title={layer.label}
-                  className={`flex flex-col items-center justify-center gap-0.5 px-2.5 py-2.5 transition-all ${idx < arr.length - 1 ? 'border-b border-gray-200' : ''}`}
+                  className={`flex flex-col items-center justify-center gap-0.5 px-2.5 py-2.5 transition-all ${idx < ALL_LAYERS.length - 1 ? 'border-b border-gray-200' : ''}`}
                   style={{ backgroundColor: isActive ? '#667eea' : 'transparent' }}
                 >
                   <span style={{ fontSize: '16px', lineHeight: 1 }}>{layer.icon}</span>
@@ -611,7 +779,7 @@ export default function App() {
       </div>
 
       {/* === BOTTOM RIGHT: Quick Actions === */}
-      <div style={{ position: 'fixed', bottom: 16, right: 16, zIndex: 50, height: '40px' }}>
+      <div data-tour="quick-actions" style={{ position: 'fixed', bottom: 16, right: 16, zIndex: 50, height: '40px', ...(highlightTarget === 'quick-actions' ? highlightStyle : {}) }}>
         <FloatingCard padding="none" backgroundOpacity={95}>
           <button
             onClick={() => setQuickActionsOpen(!quickActionsOpen)}
@@ -626,9 +794,11 @@ export default function App() {
             <div className="absolute bottom-full right-0 mb-2 min-w-[200px]" style={{ zIndex: 100 }}>
               <FloatingCard padding="small" backgroundOpacity={98}>
                 <div className="flex flex-col gap-1">
+                  <button className="text-left px-3 py-2 hover:bg-gray-50 rounded-lg text-sm">📍 Profil auf Karte setzen</button>
                   <button className="text-left px-3 py-2 hover:bg-gray-50 rounded-lg text-sm">📅 Neuer Kalendereintrag</button>
                   <button className="text-left px-3 py-2 hover:bg-gray-50 rounded-lg text-sm">🛒 Neues Angebot</button>
                   <button className="text-left px-3 py-2 hover:bg-gray-50 rounded-lg text-sm">⚔️ Neue Quest</button>
+                  <button className="text-left px-3 py-2 hover:bg-gray-50 rounded-lg text-sm">🎉 Neues Event</button>
                 </div>
               </FloatingCard>
             </div>
@@ -637,54 +807,79 @@ export default function App() {
       </div>
 
       {/* === BOTTOM CENTER: Player HUD === */}
-      <PlayerHUD onOpenModule={openModule} />
+      <div data-tour="player-hud" style={highlightTarget === 'player-hud' ? { ...highlightStyle, position: 'fixed', bottom: 8, left: '50%', transform: 'translateX(-50%)', zIndex: 45, borderRadius: 16 } : {}}>
+        <PlayerHUD onOpenModule={openModule} />
+      </div>
 
-      {/* === KACHEL-GRID === */}
-      {hasTiles && (
-        <div
-          style={{
-            position: 'fixed',
-            top: 64,
-            left: 60,
-            right: 60,
-            bottom: 88,
-            zIndex: 20,
-            display: 'grid',
-            gridTemplateColumns: 'repeat(3, 1fr)',
-            gridTemplateRows: 'repeat(2, 1fr)',
-            gap: '8px',
-            pointerEvents: 'none',
-          }}
-        >
-          {tiles.map((tile) => {
-            const span = TILE_SPAN[tile.size]
-            return (
-              <div
-                key={tile.id}
-                style={{
-                  gridColumn: `span ${span.col}`,
-                  gridRow: `span ${span.row}`,
-                  pointerEvents: 'auto',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  minHeight: 0,
-                }}
-              >
-                <FloatingCard padding="none" backgroundOpacity={98} shadow="large" rounded="large" className="flex flex-col h-full overflow-hidden">
-                  <TileHeader
-                    moduleId={tile.moduleId}
-                    size={tile.size}
-                    onResize={() => resizeTile(tile.id)}
-                    onClose={() => closeTile(tile.id)}
-                  />
-                  <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
-                    <TileContent moduleId={tile.moduleId} onHashtagClick={handleHashtagClick} />
+      {/* === KACHELN (Grid 12 Spalten, passt exakt in Viewport) === */}
+      {hasTiles && dashboardVisible && (
+        <div style={{
+          position: 'fixed',
+          top: 60,
+          left: 56,
+          right: 56,
+          bottom: 88,
+          zIndex: 20,
+          overflow: 'hidden',
+        }}>
+          <div style={{ width: '100%', height: '100%' }}>
+            <GridLayout
+              className="tile-grid"
+              layout={gridLayouts.lg}
+              cols={GRID_COLS}
+              rowHeight={Math.floor((window.innerHeight - 60 - 88 - 16) / 6)}
+              width={window.innerWidth - 112}
+              margin={[8, 8] as [number, number]}
+              containerPadding={[0, 0] as [number, number]}
+              autoSize={false}
+              compactType="vertical"
+              isResizable={!layoutLocked}
+              isDraggable={!layoutLocked}
+              draggableHandle=".tile-drag-handle"
+              onLayoutChange={handleLayoutChange}
+              resizeHandles={['se', 'sw', 'ne', 'nw', 'e', 'w', 's', 'n']}
+            >
+              {tiles.filter(tile => gridLayouts.lg.some(l => l.i === tile.id)).map((tile) => {
+                const isFull = fullscreenTileId === tile.id
+                return (
+                  <div key={tile.id} style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    background: 'rgba(255, 255, 255, 0.97)',
+                    backdropFilter: 'blur(12px)',
+                    borderRadius: 12,
+                    boxShadow: '0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08)',
+                    border: '1px solid rgba(255, 255, 255, 0.6)',
+                    overflow: 'hidden',
+                  }}>
+                    <TileHeader
+                      moduleId={tile.moduleId}
+                      onClose={() => closeTile(tile.id)}
+                      onFullscreen={() => toggleFullscreen(tile.id)}
+                      isFullscreen={isFull}
+                    />
+                    <div style={{ flex: 1, overflow: 'auto', minHeight: 0 }}>
+                      <TileContent moduleId={tile.moduleId} onHashtagClick={handleHashtagClick} />
+                    </div>
                   </div>
-                </FloatingCard>
-              </div>
-            )
-          })}
+                )
+              })}
+            </GridLayout>
+          </div>
         </div>
+      )}
+
+      {/* === MASKOTTCHEN (Eli) === */}
+      <EliMascot onHighlight={setHighlightTarget} />
+
+      {/* Tour-Highlight Animation */}
+      {highlightTarget && (
+        <style>{`
+          @keyframes tour-pulse {
+            0%, 100% { box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.5), 0 0 20px rgba(139, 92, 246, 0.3); }
+            50% { box-shadow: 0 0 0 5px rgba(139, 92, 246, 0.7), 0 0 30px rgba(139, 92, 246, 0.5); }
+          }
+        `}</style>
       )}
     </>
   )

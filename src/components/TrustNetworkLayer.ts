@@ -1,332 +1,140 @@
 /**
- * Web of Trust - Myzel-Netzwerk v4
+ * Web of Trust - Netzwerk-Daten v7
  *
- * Flächenbasierte Verteilung: jedes Land proportional zur Landfläche.
- * Russland/Kanada/Brasilien/Australien vollflächig abgedeckt.
- * Alle Knoten weiß/blau-weiß. Verbindungen: organische weiße Linien.
+ * ECHTE Onboarding-Kette: Jeder Pin hat einen parentId (wer hat ihn onboarded).
+ * Root = Berlin. Von dort breitet sich das Netzwerk über die Welt aus.
+ * Verbindungen = echte Parent→Child Beziehungen, nicht zufällige Nähe.
  *
- * Zoom-Clustering:
- * - Weit raus:  große leuchtende Knoten sichtbar (level 0 + 1)
- * - Mittel:     Regionen erscheinen (level 2)
- * - Nah rein:   individuelle Punkte (level 3)
+ * Beim Clustering werden die Verbindungen ZWISCHEN Clustern aggregiert:
+ * Wenn 3 Pins in Cluster A einen Parent in Cluster B haben,
+ * gibt es einen Arc A→B mit Stärke 3.
  */
-
-import L from 'leaflet'
 
 // ── Typen ────────────────────────────────────────────────────
 
-export interface MycelNode {
+export interface TrustPin {
   id: number
   lat: number
   lng: number
-  weight: number      // Sichtbarkeits-Gewicht 0.1–1.0
-  level: number       // Zoom-Level ab dem sichtbar: 0=immer, 1=ab zoom 3, 2=ab zoom 6, 3=ab zoom 9
-  isRoot: boolean     // "Ich" — Berlin
-  isMyNetwork: boolean
-  parentId: number | null
+  parentId: number | null   // Wer hat diesen User onboarded? null = Root
+  depth: number             // Stufen vom Root entfernt
+  isRoot: boolean
 }
 
-// ── Flächen-Zonen ────────────────────────────────────────────
-// count ist proportional zur Landfläche des Landes/Region
-// Russland ~17M km² → 60 Knoten; Vatikan → 0
-// Die Zonen decken das GESAMTE Territorium ab
-
-interface AreaZone {
+export interface ClusterNode {
+  id: string                // Grid-Key
   lat: number
   lng: number
-  radiusKm: number
-  count: number
-  weight: number  // Helligkeit der Punkte (uniform im Land)
-  level: number   // 0=immer, 1=ab zoom3, 2=ab zoom6, 3=ab zoom9
+  count: number             // Anzahl Pins in diesem Cluster
+  isRoot: boolean
+  pinIds: number[]          // Welche Pins gehören hierher
 }
 
-const AREA_ZONES: AreaZone[] = [
+export interface ArcLink {
+  startLat: number
+  startLng: number
+  endLat: number
+  endLng: number
+  strength: number          // Wie viele echte Verbindungen fließen hier
+}
 
-  // ══════════════════════════════════════════════════════════
-  // RUSSLAND (17.1M km²) — vollflächig, viele Zonen
-  // Von Kaliningrad bis Wladiwostok, von Arktis bis Kaukasus
-  // ══════════════════════════════════════════════════════════
-  { lat: 55.8,  lng: 37.6,   radiusKm: 300,  count: 8,  weight: 0.85, level: 0 }, // Moskau-Region
-  { lat: 59.9,  lng: 30.3,   radiusKm: 200,  count: 5,  weight: 0.75, level: 1 }, // St. Petersburg
-  { lat: 56.0,  lng: 50.0,   radiusKm: 350,  count: 6,  weight: 0.65, level: 1 }, // Wolga-Region
-  { lat: 57.0,  lng: 60.0,   radiusKm: 350,  count: 6,  weight: 0.60, level: 1 }, // Ural
-  { lat: 55.0,  lng: 73.4,   radiusKm: 300,  count: 5,  weight: 0.58, level: 1 }, // West-Sibirien (Omsk/Nowosibirsk)
-  { lat: 56.5,  lng: 84.0,   radiusKm: 300,  count: 5,  weight: 0.55, level: 2 }, // Nowosibirsk-Region
-  { lat: 56.0,  lng: 93.0,   radiusKm: 350,  count: 5,  weight: 0.52, level: 2 }, // Krasnojarsk
-  { lat: 52.3,  lng: 104.3,  radiusKm: 300,  count: 5,  weight: 0.55, level: 2 }, // Irkutsk/Baikalsee
-  { lat: 62.0,  lng: 129.7,  radiusKm: 400,  count: 4,  weight: 0.45, level: 2 }, // Jakutien
-  { lat: 43.1,  lng: 131.9,  radiusKm: 200,  count: 4,  weight: 0.60, level: 2 }, // Wladiwostok/Fernost
-  { lat: 53.0,  lng: 140.0,  radiusKm: 300,  count: 3,  weight: 0.40, level: 2 }, // Chabarowsk
-  // Nord-Sibirien (arktisch, sehr dünn)
-  { lat: 70.0,  lng: 60.0,   radiusKm: 500,  count: 3,  weight: 0.30, level: 2 }, // Nordrussland West
-  { lat: 70.0,  lng: 100.0,  radiusKm: 600,  count: 3,  weight: 0.25, level: 2 }, // Nordrussland Mitte
-  { lat: 68.0,  lng: 140.0,  radiusKm: 500,  count: 3,  weight: 0.25, level: 2 }, // Nordrussland Ost
-  { lat: 60.0,  lng: 115.0,  radiusKm: 400,  count: 4,  weight: 0.42, level: 2 }, // Sibirien Mitte
-  { lat: 50.0,  lng: 80.0,   radiusKm: 300,  count: 4,  weight: 0.48, level: 2 }, // Kasachstan-Grenze/Altai
+// ── Städte/Regionen als Seed-Punkte ──────────────────────────
+// Jede Stadt ist ein "Hub" — von dort breiten sich Onboardings lokal aus.
 
-  // ══════════════════════════════════════════════════════════
-  // KANADA (10.0M km²) — vollflächig Ost bis West, inkl. Arktis
-  // ══════════════════════════════════════════════════════════
-  { lat: 43.7,  lng: -79.4,  radiusKm: 250,  count: 5,  weight: 0.80, level: 0 }, // Toronto/Ontario
-  { lat: 45.5,  lng: -73.6,  radiusKm: 200,  count: 4,  weight: 0.75, level: 1 }, // Montreal/Quebec
-  { lat: 49.3,  lng: -123.1, radiusKm: 200,  count: 4,  weight: 0.72, level: 1 }, // Vancouver/BC
-  { lat: 51.0,  lng: -114.0, radiusKm: 250,  count: 4,  weight: 0.65, level: 1 }, // Calgary/Alberta
-  { lat: 50.4,  lng: -104.6, radiusKm: 300,  count: 4,  weight: 0.55, level: 2 }, // Saskatchewan/Prairies
-  { lat: 49.9,  lng: -97.1,  radiusKm: 250,  count: 3,  weight: 0.58, level: 2 }, // Manitoba/Winnipeg
-  { lat: 46.8,  lng: -71.2,  radiusKm: 200,  count: 3,  weight: 0.60, level: 2 }, // Quebec-Stadt
-  { lat: 44.6,  lng: -63.6,  radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Maritimes/Halifax
-  // Nordrkanada (dünn, aber vorhanden)
-  { lat: 60.7,  lng: -135.1, radiusKm: 400,  count: 3,  weight: 0.35, level: 2 }, // Yukon
-  { lat: 62.5,  lng: -114.3, radiusKm: 400,  count: 3,  weight: 0.32, level: 2 }, // Northwest Territories
-  { lat: 63.7,  lng: -68.5,  radiusKm: 500,  count: 3,  weight: 0.30, level: 2 }, // Nunavut
-  { lat: 74.0,  lng: -95.0,  radiusKm: 600,  count: 2,  weight: 0.22, level: 3 }, // Arktis Kanada
+interface CityHub {
+  lat: number
+  lng: number
+  name: string
+  region: string
+  population: number  // Relativer Proxy (1-100)
+}
 
-  // ══════════════════════════════════════════════════════════
-  // USA (9.8M km²) — Ost- und Westküste dicht, Mitte vorhanden
-  // ══════════════════════════════════════════════════════════
-  { lat: 40.7,  lng: -74.0,  radiusKm: 200,  count: 7,  weight: 0.92, level: 0 }, // New York Metro
-  { lat: 34.1,  lng: -118.2, radiusKm: 200,  count: 6,  weight: 0.88, level: 0 }, // Los Angeles
-  { lat: 41.9,  lng: -87.6,  radiusKm: 180,  count: 5,  weight: 0.82, level: 0 }, // Chicago
-  { lat: 37.8,  lng: -122.4, radiusKm: 150,  count: 5,  weight: 0.80, level: 1 }, // San Francisco
-  { lat: 47.6,  lng: -122.3, radiusKm: 150,  count: 4,  weight: 0.75, level: 1 }, // Seattle
-  { lat: 42.4,  lng: -71.1,  radiusKm: 120,  count: 4,  weight: 0.72, level: 1 }, // Boston
-  { lat: 38.9,  lng: -77.0,  radiusKm: 150,  count: 4,  weight: 0.78, level: 1 }, // Washington DC
-  { lat: 29.8,  lng: -95.4,  radiusKm: 180,  count: 4,  weight: 0.70, level: 1 }, // Texas/Houston
-  { lat: 25.8,  lng: -80.2,  radiusKm: 150,  count: 4,  weight: 0.68, level: 1 }, // Florida/Miami
-  // Inland/Mitte (dünn aber vorhanden)
-  { lat: 39.7,  lng: -104.9, radiusKm: 250,  count: 4,  weight: 0.55, level: 2 }, // Colorado/Denver
-  { lat: 36.2,  lng: -115.2, radiusKm: 200,  count: 3,  weight: 0.52, level: 2 }, // Nevada/Las Vegas
-  { lat: 44.0,  lng: -103.0, radiusKm: 350,  count: 4,  weight: 0.45, level: 2 }, // Dakotas/Great Plains
-  { lat: 37.0,  lng: -97.0,  radiusKm: 300,  count: 4,  weight: 0.48, level: 2 }, // Kansas/Oklahoma
-  { lat: 46.9,  lng: -110.0, radiusKm: 300,  count: 3,  weight: 0.42, level: 2 }, // Montana/Wyoming
-  { lat: 38.0,  lng: -84.5,  radiusKm: 250,  count: 4,  weight: 0.58, level: 2 }, // Kentucky/Tennessee
-  { lat: 32.8,  lng: -83.6,  radiusKm: 250,  count: 4,  weight: 0.55, level: 2 }, // Georgia/Alabama
-  { lat: 44.0,  lng: -120.0, radiusKm: 250,  count: 3,  weight: 0.50, level: 2 }, // Oregon
-  // Alaska
-  { lat: 64.2,  lng: -153.0, radiusKm: 500,  count: 3,  weight: 0.35, level: 2 }, // Alaska
+const CITY_HUBS: CityHub[] = [
+  // EUROPA (vom Root Berlin aus)
+  { lat: 52.52,  lng: 13.405, name: 'Berlin',     region: 'EU', population: 100 },
+  { lat: 48.86,  lng: 2.35,   name: 'Paris',      region: 'EU', population: 85 },
+  { lat: 51.51,  lng: -0.13,  name: 'London',     region: 'EU', population: 90 },
+  { lat: 48.14,  lng: 11.58,  name: 'München',    region: 'EU', population: 55 },
+  { lat: 50.94,  lng: 6.96,   name: 'Köln',       region: 'EU', population: 50 },
+  { lat: 53.55,  lng: 9.99,   name: 'Hamburg',    region: 'EU', population: 55 },
+  { lat: 52.37,  lng: 4.90,   name: 'Amsterdam',  region: 'EU', population: 50 },
+  { lat: 50.85,  lng: 4.35,   name: 'Brüssel',   region: 'EU', population: 40 },
+  { lat: 48.21,  lng: 16.37,  name: 'Wien',       region: 'EU', population: 55 },
+  { lat: 47.37,  lng: 8.54,   name: 'Zürich',     region: 'EU', population: 40 },
+  { lat: 41.90,  lng: 12.50,  name: 'Rom',        region: 'EU', population: 65 },
+  { lat: 45.46,  lng: 9.19,   name: 'Mailand',    region: 'EU', population: 50 },
+  { lat: 40.42,  lng: -3.70,  name: 'Madrid',     region: 'EU', population: 65 },
+  { lat: 41.39,  lng: 2.17,   name: 'Barcelona',  region: 'EU', population: 55 },
+  { lat: 38.72,  lng: -9.14,  name: 'Lissabon',   region: 'EU', population: 40 },
+  { lat: 55.68,  lng: 12.57,  name: 'Kopenhagen', region: 'EU', population: 35 },
+  { lat: 59.33,  lng: 18.07,  name: 'Stockholm',  region: 'EU', population: 35 },
+  { lat: 60.17,  lng: 24.94,  name: 'Helsinki',   region: 'EU', population: 30 },
+  { lat: 59.91,  lng: 10.75,  name: 'Oslo',       region: 'EU', population: 30 },
+  { lat: 52.23,  lng: 21.01,  name: 'Warschau',   region: 'EU', population: 45 },
+  { lat: 50.08,  lng: 14.44,  name: 'Prag',       region: 'EU', population: 40 },
+  { lat: 47.50,  lng: 19.04,  name: 'Budapest',   region: 'EU', population: 40 },
+  { lat: 44.43,  lng: 26.10,  name: 'Bukarest',   region: 'EU', population: 35 },
+  { lat: 37.98,  lng: 23.73,  name: 'Athen',      region: 'EU', population: 35 },
+  { lat: 41.01,  lng: 28.98,  name: 'Istanbul',   region: 'EU', population: 70 },
+  { lat: 50.45,  lng: 30.52,  name: 'Kiew',       region: 'EU', population: 40 },
 
-  // ══════════════════════════════════════════════════════════
-  // BRASILIEN (8.5M km²) — Amazonas vollflächig
-  // ══════════════════════════════════════════════════════════
-  { lat: -23.6, lng: -46.6,  radiusKm: 200,  count: 5,  weight: 0.80, level: 0 }, // São Paulo
-  { lat: -22.9, lng: -43.2,  radiusKm: 150,  count: 4,  weight: 0.72, level: 1 }, // Rio de Janeiro
-  { lat: -15.8, lng: -47.9,  radiusKm: 150,  count: 3,  weight: 0.65, level: 1 }, // Brasília
-  { lat: -3.7,  lng: -38.5,  radiusKm: 150,  count: 3,  weight: 0.58, level: 1 }, // Fortaleza/Nordeste
-  { lat: -13.0, lng: -38.5,  radiusKm: 150,  count: 3,  weight: 0.58, level: 2 }, // Salvador/Bahia
-  { lat: -8.1,  lng: -34.9,  radiusKm: 150,  count: 3,  weight: 0.55, level: 2 }, // Recife/Pernambuco
-  { lat: -3.1,  lng: -60.0,  radiusKm: 250,  count: 4,  weight: 0.55, level: 2 }, // Manaus/Zentralamazonas
-  // Amazonas-Regenwald (dünn aber riesig)
-  { lat: -5.0,  lng: -55.0,  radiusKm: 400,  count: 4,  weight: 0.38, level: 2 }, // Amazonas West
-  { lat: -8.0,  lng: -65.0,  radiusKm: 400,  count: 4,  weight: 0.35, level: 2 }, // Amazonas SW
-  { lat: -2.0,  lng: -70.0,  radiusKm: 350,  count: 3,  weight: 0.32, level: 2 }, // Amazonas NW
-  { lat: -12.0, lng: -48.0,  radiusKm: 350,  count: 4,  weight: 0.42, level: 2 }, // Cerrado/Mato Grosso
-  { lat: -20.0, lng: -55.0,  radiusKm: 300,  count: 4,  weight: 0.48, level: 2 }, // Mato Grosso do Sul
-  { lat: -30.0, lng: -51.2,  radiusKm: 200,  count: 4,  weight: 0.60, level: 2 }, // Porto Alegre/Südbrasilien
+  // NORDAMERIKA
+  { lat: 40.71,  lng: -74.01, name: 'New York',     region: 'NA', population: 95 },
+  { lat: 34.05,  lng: -118.24,name: 'Los Angeles',  region: 'NA', population: 80 },
+  { lat: 41.88,  lng: -87.63, name: 'Chicago',      region: 'NA', population: 60 },
+  { lat: 37.77,  lng: -122.42,name: 'San Francisco', region: 'NA', population: 55 },
+  { lat: 47.61,  lng: -122.33,name: 'Seattle',      region: 'NA', population: 45 },
+  { lat: 25.76,  lng: -80.19, name: 'Miami',        region: 'NA', population: 50 },
+  { lat: 43.65,  lng: -79.38, name: 'Toronto',      region: 'NA', population: 55 },
+  { lat: 45.50,  lng: -73.57, name: 'Montreal',     region: 'NA', population: 40 },
+  { lat: 49.28,  lng: -123.12,name: 'Vancouver',    region: 'NA', population: 40 },
+  { lat: 19.43,  lng: -99.13, name: 'Mexiko-Stadt', region: 'NA', population: 70 },
 
-  // ══════════════════════════════════════════════════════════
-  // AUSTRALIEN (7.7M km²) — Outback vollflächig
-  // ══════════════════════════════════════════════════════════
-  { lat: -33.9, lng: 151.2,  radiusKm: 150,  count: 4,  weight: 0.75, level: 0 }, // Sydney
-  { lat: -37.8, lng: 145.0,  radiusKm: 150,  count: 4,  weight: 0.70, level: 1 }, // Melbourne
-  { lat: -27.5, lng: 153.0,  radiusKm: 120,  count: 3,  weight: 0.62, level: 1 }, // Brisbane
-  { lat: -31.9, lng: 115.9,  radiusKm: 150,  count: 3,  weight: 0.60, level: 1 }, // Perth
-  { lat: -34.9, lng: 138.6,  radiusKm: 120,  count: 2,  weight: 0.55, level: 2 }, // Adelaide
-  { lat: -12.5, lng: 130.8,  radiusKm: 150,  count: 2,  weight: 0.52, level: 2 }, // Darwin/Northern Territory
-  // Outback (sehr dünn aber vorhanden)
-  { lat: -25.0, lng: 130.0,  radiusKm: 500,  count: 4,  weight: 0.32, level: 2 }, // Outback Zentrum
-  { lat: -20.0, lng: 140.0,  radiusKm: 400,  count: 3,  weight: 0.30, level: 2 }, // Queensland Inland
-  { lat: -30.0, lng: 125.0,  radiusKm: 450,  count: 3,  weight: 0.28, level: 2 }, // Westaustralia Inland
-  { lat: -33.0, lng: 120.0,  radiusKm: 350,  count: 3,  weight: 0.30, level: 2 }, // Nullarbor/Südküste
+  // SÜDAMERIKA
+  { lat: -23.55, lng: -46.63, name: 'São Paulo',    region: 'SA', population: 80 },
+  { lat: -22.91, lng: -43.17, name: 'Rio de Janeiro',region: 'SA', population: 55 },
+  { lat: -34.60, lng: -58.38, name: 'Buenos Aires', region: 'SA', population: 55 },
+  { lat: -33.45, lng: -70.67, name: 'Santiago',     region: 'SA', population: 40 },
+  { lat: -12.05, lng: -77.04, name: 'Lima',         region: 'SA', population: 45 },
+  { lat: 4.71,   lng: -74.07, name: 'Bogotá',       region: 'SA', population: 45 },
 
-  // ══════════════════════════════════════════════════════════
-  // INDIEN (3.3M km²)
-  // ══════════════════════════════════════════════════════════
-  { lat: 19.1,  lng: 72.9,   radiusKm: 180,  count: 6,  weight: 0.85, level: 0 }, // Mumbai
-  { lat: 28.6,  lng: 77.2,   radiusKm: 180,  count: 6,  weight: 0.85, level: 0 }, // Delhi
-  { lat: 12.9,  lng: 77.6,   radiusKm: 150,  count: 5,  weight: 0.80, level: 1 }, // Bangalore
-  { lat: 22.6,  lng: 88.4,   radiusKm: 150,  count: 5,  weight: 0.75, level: 1 }, // Kolkata
-  { lat: 13.1,  lng: 80.3,   radiusKm: 120,  count: 4,  weight: 0.72, level: 1 }, // Chennai
-  { lat: 17.4,  lng: 78.5,   radiusKm: 120,  count: 4,  weight: 0.70, level: 1 }, // Hyderabad
-  { lat: 23.0,  lng: 72.6,   radiusKm: 200,  count: 4,  weight: 0.65, level: 2 }, // Gujarat
-  { lat: 26.0,  lng: 80.0,   radiusKm: 200,  count: 4,  weight: 0.65, level: 2 }, // Uttar Pradesh
-  { lat: 25.6,  lng: 85.1,   radiusKm: 180,  count: 4,  weight: 0.62, level: 2 }, // Bihar/Jharkhand
-  { lat: 20.0,  lng: 85.8,   radiusKm: 200,  count: 4,  weight: 0.60, level: 2 }, // Odisha
-  { lat: 15.5,  lng: 74.0,   radiusKm: 200,  count: 3,  weight: 0.58, level: 2 }, // Karnataka/Goa
-  { lat: 26.0,  lng: 91.7,   radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Assam/NE-Indien
-  { lat: 32.0,  lng: 74.0,   radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Punjab/Nordindien
-  { lat: 22.0,  lng: 78.0,   radiusKm: 250,  count: 4,  weight: 0.58, level: 2 }, // Madhya Pradesh
+  // AFRIKA
+  { lat: 30.04,  lng: 31.24,  name: 'Kairo',       region: 'AF', population: 60 },
+  { lat: 6.52,   lng: 3.38,   name: 'Lagos',       region: 'AF', population: 65 },
+  { lat: -1.29,  lng: 36.82,  name: 'Nairobi',     region: 'AF', population: 40 },
+  { lat: -33.93, lng: 18.42,  name: 'Kapstadt',    region: 'AF', population: 35 },
+  { lat: -26.20, lng: 28.05,  name: 'Johannesburg',region: 'AF', population: 40 },
+  { lat: 5.56,   lng: -0.19,  name: 'Accra',       region: 'AF', population: 30 },
+  { lat: 9.02,   lng: 38.75,  name: 'Addis Abeba', region: 'AF', population: 35 },
+  { lat: 33.59,  lng: -7.62,  name: 'Casablanca',  region: 'AF', population: 35 },
 
-  // ══════════════════════════════════════════════════════════
-  // CHINA (9.6M km²)
-  // ══════════════════════════════════════════════════════════
-  { lat: 39.9,  lng: 116.4,  radiusKm: 200,  count: 6,  weight: 0.88, level: 0 }, // Beijing
-  { lat: 31.2,  lng: 121.5,  radiusKm: 200,  count: 6,  weight: 0.88, level: 0 }, // Shanghai
-  { lat: 22.5,  lng: 114.1,  radiusKm: 180,  count: 5,  weight: 0.85, level: 1 }, // Shenzhen/HK
-  { lat: 23.1,  lng: 113.3,  radiusKm: 150,  count: 5,  weight: 0.80, level: 1 }, // Guangzhou
-  { lat: 30.6,  lng: 104.1,  radiusKm: 200,  count: 5,  weight: 0.75, level: 1 }, // Chengdu
-  { lat: 34.3,  lng: 108.9,  radiusKm: 200,  count: 4,  weight: 0.68, level: 2 }, // Xi'an/Shaanxi
-  { lat: 30.6,  lng: 114.3,  radiusKm: 150,  count: 4,  weight: 0.70, level: 2 }, // Wuhan
-  { lat: 36.1,  lng: 120.4,  radiusKm: 150,  count: 4,  weight: 0.68, level: 2 }, // Shandong/Qingdao
-  { lat: 43.8,  lng: 87.6,   radiusKm: 300,  count: 3,  weight: 0.50, level: 2 }, // Xinjiang/Urumqi
-  { lat: 29.7,  lng: 91.1,   radiusKm: 300,  count: 3,  weight: 0.42, level: 2 }, // Tibet/Lhasa
-  { lat: 41.8,  lng: 123.4,  radiusKm: 200,  count: 3,  weight: 0.60, level: 2 }, // Shenyang/Nordchina
-  { lat: 25.0,  lng: 101.0,  radiusKm: 250,  count: 3,  weight: 0.55, level: 2 }, // Yunnan
+  // ASIEN
+  { lat: 35.68,  lng: 139.69, name: 'Tokyo',       region: 'AS', population: 95 },
+  { lat: 37.57,  lng: 126.98, name: 'Seoul',       region: 'AS', population: 70 },
+  { lat: 39.90,  lng: 116.40, name: 'Peking',      region: 'AS', population: 80 },
+  { lat: 31.23,  lng: 121.47, name: 'Shanghai',    region: 'AS', population: 80 },
+  { lat: 22.54,  lng: 114.05, name: 'Shenzhen',    region: 'AS', population: 55 },
+  { lat: 22.32,  lng: 114.17, name: 'Hongkong',    region: 'AS', population: 50 },
+  { lat: 25.03,  lng: 121.57, name: 'Taipei',      region: 'AS', population: 40 },
+  { lat: 1.35,   lng: 103.82, name: 'Singapur',    region: 'AS', population: 50 },
+  { lat: 13.76,  lng: 100.50, name: 'Bangkok',     region: 'AS', population: 55 },
+  { lat: -6.21,  lng: 106.85, name: 'Jakarta',     region: 'AS', population: 55 },
+  { lat: 28.61,  lng: 77.21,  name: 'Delhi',       region: 'AS', population: 75 },
+  { lat: 19.08,  lng: 72.88,  name: 'Mumbai',      region: 'AS', population: 70 },
+  { lat: 12.97,  lng: 77.59,  name: 'Bangalore',   region: 'AS', population: 50 },
 
-  // ══════════════════════════════════════════════════════════
-  // WESTEUROPA (dicht, Standardzonen)
-  // ══════════════════════════════════════════════════════════
-  { lat: 51.5,  lng: 0.1,    radiusKm: 150,  count: 7,  weight: 0.95, level: 0 }, // London + Umland
-  { lat: 48.9,  lng: 2.4,    radiusKm: 120,  count: 6,  weight: 0.90, level: 0 }, // Paris
-  { lat: 52.5,  lng: 13.4,   radiusKm: 150,  count: 7,  weight: 1.00, level: 0 }, // Berlin (Root)
-  { lat: 51.5,  lng: 7.5,    radiusKm: 150,  count: 7,  weight: 0.92, level: 0 }, // Ruhrgebiet
-  { lat: 48.2,  lng: 11.6,   radiusKm: 120,  count: 5,  weight: 0.85, level: 1 }, // München
-  { lat: 47.4,  lng: 8.5,    radiusKm: 100,  count: 4,  weight: 0.80, level: 1 }, // Zürich
-  { lat: 48.2,  lng: 16.4,   radiusKm: 100,  count: 4,  weight: 0.82, level: 1 }, // Wien
-  { lat: 52.4,  lng: 4.9,    radiusKm: 100,  count: 4,  weight: 0.85, level: 1 }, // Amsterdam
-  { lat: 50.9,  lng: 4.4,    radiusKm: 100,  count: 4,  weight: 0.80, level: 1 }, // Brüssel
-  { lat: 40.4,  lng: -3.7,   radiusKm: 150,  count: 5,  weight: 0.82, level: 1 }, // Madrid
-  { lat: 41.4,  lng: 2.2,    radiusKm: 120,  count: 4,  weight: 0.78, level: 1 }, // Barcelona
-  { lat: 41.9,  lng: 12.5,   radiusKm: 150,  count: 5,  weight: 0.80, level: 1 }, // Rom
-  { lat: 45.5,  lng: 9.2,    radiusKm: 100,  count: 4,  weight: 0.78, level: 1 }, // Mailand
-  { lat: 53.5,  lng: -2.5,   radiusKm: 120,  count: 4,  weight: 0.78, level: 1 }, // Manchester/Leeds
-  { lat: 55.9,  lng: -3.2,   radiusKm: 100,  count: 3,  weight: 0.70, level: 1 }, // Edinburgh
-  { lat: 59.3,  lng: 18.1,   radiusKm: 100,  count: 3,  weight: 0.70, level: 1 }, // Stockholm
-  { lat: 55.7,  lng: 12.6,   radiusKm: 100,  count: 3,  weight: 0.68, level: 1 }, // Kopenhagen
-  { lat: 60.2,  lng: 24.9,   radiusKm: 100,  count: 3,  weight: 0.65, level: 1 }, // Helsinki
-  { lat: 59.9,  lng: 10.7,   radiusKm: 100,  count: 3,  weight: 0.65, level: 1 }, // Oslo
-  { lat: 52.2,  lng: 21.0,   radiusKm: 120,  count: 4,  weight: 0.72, level: 1 }, // Warschau
-  { lat: 50.1,  lng: 14.4,   radiusKm: 100,  count: 3,  weight: 0.70, level: 2 }, // Prag
-  { lat: 47.5,  lng: 19.0,   radiusKm: 100,  count: 3,  weight: 0.70, level: 2 }, // Budapest
-  { lat: 50.5,  lng: 30.5,   radiusKm: 120,  count: 3,  weight: 0.72, level: 2 }, // Kiew
-  { lat: 41.0,  lng: 29.0,   radiusKm: 150,  count: 5,  weight: 0.82, level: 1 }, // Istanbul
-  { lat: 38.7,  lng: -9.1,   radiusKm: 100,  count: 3,  weight: 0.60, level: 2 }, // Lissabon
-  { lat: 38.0,  lng: 23.7,   radiusKm: 100,  count: 3,  weight: 0.60, level: 2 }, // Athen
-  // Skandinavien-Fläche (dünn aber vorhanden)
-  { lat: 62.0,  lng: 14.0,   radiusKm: 400,  count: 4,  weight: 0.40, level: 2 }, // Schweden Inland
-  { lat: 65.0,  lng: 26.0,   radiusKm: 400,  count: 4,  weight: 0.38, level: 2 }, // Finnland/Lappland
-  { lat: 65.0,  lng: 14.0,   radiusKm: 400,  count: 3,  weight: 0.36, level: 2 }, // Norwegen Inland
+  // NAHER OSTEN
+  { lat: 25.20,  lng: 55.27,  name: 'Dubai',       region: 'ME', population: 40 },
+  { lat: 32.09,  lng: 34.77,  name: 'Tel Aviv',    region: 'ME', population: 35 },
 
-  // ══════════════════════════════════════════════════════════
-  // SÜDAMERIKA Restländer
-  // ══════════════════════════════════════════════════════════
-  { lat: -34.6, lng: -58.4,  radiusKm: 150,  count: 4,  weight: 0.72, level: 1 }, // Buenos Aires
-  { lat: -31.4, lng: -64.2,  radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Argentinien Inland
-  { lat: -38.0, lng: -67.0,  radiusKm: 300,  count: 3,  weight: 0.40, level: 2 }, // Patagonien Argentinien
-  { lat: 4.7,   lng: -74.1,  radiusKm: 150,  count: 3,  weight: 0.60, level: 1 }, // Bogotá
-  { lat: 7.0,   lng: -73.0,  radiusKm: 250,  count: 3,  weight: 0.45, level: 2 }, // Kolumbien Inland
-  { lat: -12.0, lng: -77.0,  radiusKm: 150,  count: 3,  weight: 0.58, level: 1 }, // Lima
-  { lat: -10.0, lng: -75.0,  radiusKm: 300,  count: 3,  weight: 0.38, level: 2 }, // Peru Inland
-  { lat: -33.5, lng: -70.7,  radiusKm: 150,  count: 3,  weight: 0.58, level: 2 }, // Santiago
-  { lat: -45.0, lng: -72.0,  radiusKm: 350,  count: 3,  weight: 0.35, level: 2 }, // Patagonien Chile
-  { lat: -16.5, lng: -68.1,  radiusKm: 200,  count: 3,  weight: 0.48, level: 2 }, // Bolivien/La Paz
-  { lat: -25.3, lng: -57.6,  radiusKm: 200,  count: 3,  weight: 0.50, level: 2 }, // Paraguay
-  { lat: -32.5, lng: -55.0,  radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Uruguay
-  { lat: 5.9,   lng: -55.2,  radiusKm: 200,  count: 3,  weight: 0.40, level: 2 }, // Guyana/Suriname
-  { lat: 4.0,   lng: -63.0,  radiusKm: 250,  count: 3,  weight: 0.40, level: 2 }, // Venezuela Inland
+  // RUSSLAND
+  { lat: 55.76,  lng: 37.62,  name: 'Moskau',      region: 'RU', population: 65 },
+  { lat: 59.93,  lng: 30.32,  name: 'St. Petersburg',region:'RU', population: 40 },
 
-  // ══════════════════════════════════════════════════════════
-  // AFRIKA (vollflächig)
-  // ══════════════════════════════════════════════════════════
-  { lat: 30.1,  lng: 31.2,   radiusKm: 150,  count: 5,  weight: 0.72, level: 0 }, // Kairo
-  { lat: 6.5,   lng: 3.4,    radiusKm: 150,  count: 5,  weight: 0.70, level: 0 }, // Lagos
-  { lat: -1.3,  lng: 36.8,   radiusKm: 150,  count: 4,  weight: 0.60, level: 1 }, // Nairobi
-  { lat: -33.9, lng: 18.4,   radiusKm: 150,  count: 4,  weight: 0.60, level: 1 }, // Kapstadt
-  { lat: -26.2, lng: 28.0,   radiusKm: 150,  count: 4,  weight: 0.62, level: 1 }, // Johannesburg
-  { lat: 5.6,   lng: -0.2,   radiusKm: 150,  count: 3,  weight: 0.52, level: 2 }, // Accra
-  { lat: 14.7,  lng: -17.4,  radiusKm: 150,  count: 3,  weight: 0.48, level: 2 }, // Dakar
-  { lat: 12.4,  lng: -1.5,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Ouagadougou/Burkina
-  { lat: 12.4,  lng: 13.3,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Nordnigeria/Tschad
-  { lat: 3.9,   lng: 11.5,   radiusKm: 200,  count: 3,  weight: 0.48, level: 2 }, // Kamerun
-  { lat: -4.3,  lng: 15.3,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Kinshasa/Kongo
-  { lat: -8.8,  lng: 25.0,   radiusKm: 300,  count: 3,  weight: 0.42, level: 2 }, // Kongo/Sambia
-  { lat: -15.4, lng: 28.3,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Sambia/Simbabwe
-  { lat: -25.9, lng: 32.6,   radiusKm: 200,  count: 3,  weight: 0.48, level: 2 }, // Mosambik
-  { lat: -19.0, lng: 47.5,   radiusKm: 200,  count: 3,  weight: 0.42, level: 2 }, // Madagaskar
-  { lat: 9.0,   lng: 38.7,   radiusKm: 200,  count: 3,  weight: 0.50, level: 2 }, // Äthiopien
-  { lat: 15.6,  lng: 32.5,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Sudan/Khartoum
-  // Sahara (sehr dünn aber vorhanden)
-  { lat: 23.0,  lng: 5.0,    radiusKm: 600,  count: 4,  weight: 0.22, level: 2 }, // Algerien/Sahara West
-  { lat: 23.0,  lng: 20.0,   radiusKm: 600,  count: 4,  weight: 0.20, level: 2 }, // Sahara Mitte/Libyen
-  { lat: 20.0,  lng: 35.0,   radiusKm: 500,  count: 3,  weight: 0.22, level: 2 }, // Sahara Ost/Sudan
-
-  // ══════════════════════════════════════════════════════════
-  // NAHER OSTEN & ZENTRALASIEN
-  // ══════════════════════════════════════════════════════════
-  { lat: 32.1,  lng: 34.8,   radiusKm: 100,  count: 4,  weight: 0.70, level: 1 }, // Tel Aviv
-  { lat: 25.2,  lng: 55.3,   radiusKm: 100,  count: 4,  weight: 0.68, level: 1 }, // Dubai
-  { lat: 24.7,  lng: 46.7,   radiusKm: 150,  count: 3,  weight: 0.60, level: 1 }, // Riad
-  { lat: 33.3,  lng: 44.4,   radiusKm: 150,  count: 3,  weight: 0.55, level: 2 }, // Bagdad
-  { lat: 35.7,  lng: 51.4,   radiusKm: 150,  count: 3,  weight: 0.58, level: 2 }, // Teheran
-  { lat: 33.5,  lng: 36.3,   radiusKm: 100,  count: 3,  weight: 0.55, level: 2 }, // Damaskus
-  { lat: 23.6,  lng: 58.6,   radiusKm: 200,  count: 3,  weight: 0.45, level: 2 }, // Oman
-  { lat: 25.0,  lng: 45.0,   radiusKm: 400,  count: 3,  weight: 0.35, level: 2 }, // Saudi-Arabien Inland
-  // Kasachstan/Zentralasien (riesig, dünn)
-  { lat: 51.2,  lng: 71.4,   radiusKm: 400,  count: 3,  weight: 0.40, level: 2 }, // Kasachstan Nord
-  { lat: 43.0,  lng: 58.0,   radiusKm: 400,  count: 3,  weight: 0.38, level: 2 }, // Kasachstan Süd/Usbekistan
-  { lat: 39.0,  lng: 66.0,   radiusKm: 300,  count: 3,  weight: 0.42, level: 2 }, // Usbekistan/Turkmenistan
-  { lat: 37.9,  lng: 58.4,   radiusKm: 250,  count: 3,  weight: 0.45, level: 2 }, // Turkmenistan
-  { lat: 34.5,  lng: 69.2,   radiusKm: 250,  count: 3,  weight: 0.45, level: 2 }, // Afghanistan/Kabul
-  { lat: 33.7,  lng: 73.1,   radiusKm: 150,  count: 3,  weight: 0.55, level: 2 }, // Pakistan/Islamabad
-  { lat: 24.9,  lng: 67.0,   radiusKm: 150,  count: 3,  weight: 0.60, level: 2 }, // Karachi
-
-  // ══════════════════════════════════════════════════════════
-  // SÜDOSTASIEN / OZEANIEN
-  // ══════════════════════════════════════════════════════════
-  { lat: 23.8,  lng: 90.4,   radiusKm: 150,  count: 5,  weight: 0.78, level: 1 }, // Dhaka
-  { lat: 6.9,   lng: 79.9,   radiusKm: 100,  count: 3,  weight: 0.55, level: 2 }, // Colombo
-  { lat: 1.4,   lng: 103.8,  radiusKm: 80,   count: 4,  weight: 0.80, level: 1 }, // Singapur
-  { lat: 13.8,  lng: 100.5,  radiusKm: 150,  count: 4,  weight: 0.70, level: 1 }, // Bangkok
-  { lat: -6.2,  lng: 106.8,  radiusKm: 150,  count: 4,  weight: 0.68, level: 1 }, // Jakarta
-  { lat: -7.3,  lng: 112.7,  radiusKm: 200,  count: 3,  weight: 0.55, level: 2 }, // Java Ost
-  { lat: 0.0,   lng: 109.0,  radiusKm: 300,  count: 3,  weight: 0.42, level: 2 }, // Borneo
-  { lat: -1.3,  lng: 120.0,  radiusKm: 350,  count: 3,  weight: 0.38, level: 2 }, // Sulawesi
-  { lat: 25.1,  lng: 121.6,  radiusKm: 100,  count: 3,  weight: 0.70, level: 2 }, // Taipei
-  { lat: 21.0,  lng: 105.8,  radiusKm: 100,  count: 3,  weight: 0.62, level: 2 }, // Hanoi
-  { lat: 10.8,  lng: 106.7,  radiusKm: 100,  count: 3,  weight: 0.65, level: 2 }, // Ho Chi Minh
-  { lat: 4.2,   lng: 101.7,  radiusKm: 150,  count: 3,  weight: 0.62, level: 2 }, // Kuala Lumpur
-  { lat: 11.6,  lng: 104.9,  radiusKm: 150,  count: 3,  weight: 0.55, level: 2 }, // Phnom Penh
-  { lat: 14.1,  lng: 108.3,  radiusKm: 200,  count: 3,  weight: 0.50, level: 2 }, // Vietnam Inland
-  { lat: 16.5,  lng: 96.0,   radiusKm: 200,  count: 3,  weight: 0.52, level: 2 }, // Myanmar/Yangon
-  { lat: 27.7,  lng: 85.3,   radiusKm: 150,  count: 3,  weight: 0.50, level: 2 }, // Nepal
-  // Philippinen
-  { lat: 14.6,  lng: 121.0,  radiusKm: 150,  count: 3,  weight: 0.65, level: 2 }, // Manila
-  { lat: 10.0,  lng: 124.0,  radiusKm: 200,  count: 3,  weight: 0.48, level: 2 }, // Visayas
-  // Neuseeland
-  { lat: -36.9, lng: 174.8,  radiusKm: 120,  count: 3,  weight: 0.60, level: 2 }, // Auckland
-  { lat: -44.0, lng: 170.0,  radiusKm: 200,  count: 2,  weight: 0.45, level: 2 }, // Südinsel
-
-  // ══════════════════════════════════════════════════════════
-  // OSTASIEN RESTLÄNDER
-  // ══════════════════════════════════════════════════════════
-  { lat: 35.7,  lng: 139.7,  radiusKm: 150,  count: 7,  weight: 0.92, level: 0 }, // Tokyo
-  { lat: 34.7,  lng: 135.5,  radiusKm: 120,  count: 5,  weight: 0.85, level: 1 }, // Osaka/Kyoto
-  { lat: 37.6,  lng: 127.0,  radiusKm: 150,  count: 5,  weight: 0.85, level: 1 }, // Seoul
-  { lat: 35.2,  lng: 136.9,  radiusKm: 100,  count: 3,  weight: 0.72, level: 2 }, // Nagoya
-  { lat: 33.6,  lng: 130.4,  radiusKm: 100,  count: 3,  weight: 0.68, level: 2 }, // Fukuoka/Kyushu
-  { lat: 43.1,  lng: 141.4,  radiusKm: 150,  count: 3,  weight: 0.62, level: 2 }, // Sapporo/Hokkaido
-  { lat: 35.1,  lng: 129.1,  radiusKm: 100,  count: 3,  weight: 0.68, level: 2 }, // Busan
-  // Mongolei (riesig, sehr dünn)
-  { lat: 47.9,  lng: 106.9,  radiusKm: 300,  count: 2,  weight: 0.45, level: 2 }, // Ulaanbaatar
-  { lat: 46.0,  lng: 95.0,   radiusKm: 500,  count: 3,  weight: 0.25, level: 2 }, // Mongolei Westen
-  { lat: 44.0,  lng: 112.0,  radiusKm: 500,  count: 3,  weight: 0.22, level: 2 }, // Mongolei Osten
-
-  // ══════════════════════════════════════════════════════════
-  // MEXIKO / ZENTRALAMERIKA / KARIBIK
-  // ══════════════════════════════════════════════════════════
-  { lat: 19.4,  lng: -99.1,  radiusKm: 150,  count: 5,  weight: 0.80, level: 1 }, // Mexico City
-  { lat: 20.9,  lng: -89.6,  radiusKm: 200,  count: 3,  weight: 0.52, level: 2 }, // Yucatan/Mexiko Ost
-  { lat: 29.1,  lng: -110.9, radiusKm: 300,  count: 3,  weight: 0.45, level: 2 }, // Nordmexiko
-  { lat: 14.6,  lng: -90.5,  radiusKm: 150,  count: 3,  weight: 0.52, level: 2 }, // Guatemala
-  { lat: 9.9,   lng: -84.1,  radiusKm: 200,  count: 3,  weight: 0.50, level: 2 }, // Costa Rica
-  { lat: 23.1,  lng: -82.4,  radiusKm: 100,  count: 3,  weight: 0.58, level: 2 }, // Kuba
-
-  // ══════════════════════════════════════════════════════════
-  // GRÖNLAND (2.2M km²) / ISLAND / ARKTIS
-  // ══════════════════════════════════════════════════════════
-  { lat: 64.2,  lng: -51.7,  radiusKm: 200,  count: 2,  weight: 0.40, level: 2 }, // Grönland Süd/Nuuk
-  { lat: 72.0,  lng: -40.0,  radiusKm: 500,  count: 2,  weight: 0.22, level: 2 }, // Grönland Nord
-  { lat: 64.1,  lng: -21.9,  radiusKm: 150,  count: 2,  weight: 0.52, level: 2 }, // Reykjavik/Island
-
+  // OZEANIEN
+  { lat: -33.87, lng: 151.21, name: 'Sydney',      region: 'OC', population: 50 },
+  { lat: -37.81, lng: 144.96, name: 'Melbourne',   region: 'OC', population: 45 },
+  { lat: -36.85, lng: 174.76, name: 'Auckland',    region: 'OC', population: 30 },
 ]
 
 // ── Seeded Random ────────────────────────────────────────────
@@ -339,292 +147,425 @@ function seededRandom(seed: number): () => number {
   }
 }
 
-// ── Netzwerk generieren ──────────────────────────────────────
+// ── Onboarding-Baum generieren ───────────────────────────────
+// Berlin (Root) onboarded Leute in Berlin, die onboarden Leute in
+// anderen deutschen Städten, die onboarden Leute in Europa, die
+// onboarden Leute weltweit. Ein realistischer Ausbreitungs-Baum.
 
-let cachedNodes: MycelNode[] | null = null
+let cachedPins: TrustPin[] | null = null
+let cachedConnections: { from: number; to: number }[] | null = null
 
-export function generateTrustNetwork(): MycelNode[] {
-  if (cachedNodes) return cachedNodes
+export function generateTrustNetwork(): { pins: TrustPin[]; connections: { from: number; to: number }[] } {
+  if (cachedPins && cachedConnections) return { pins: cachedPins, connections: cachedConnections }
 
-  const rng = seededRandom(1337)
-  const nodes: MycelNode[] = []
-  let id = 0
+  const rng = seededRandom(42)
+  const pins: TrustPin[] = []
+  const connections: { from: number; to: number }[] = []
 
-  for (const zone of AREA_ZONES) {
-    const kmPerDegLat = 111
-    const kmPerDegLng = 111 * Math.cos((zone.lat * Math.PI) / 180)
+  // Root-Pin: Berlin
+  pins.push({ id: 0, lat: 52.52, lng: 13.405, parentId: null, depth: 0, isRoot: true })
 
-    for (let i = 0; i < zone.count; i++) {
-      // Gleichmäßige Flächenverteilung
+  // Phase 1: Root onboarded Hub-Pioniere
+  // Jede Stadt bekommt einen "Pionier" der vom nächsten Hub onboarded wurde
+  // Wir bauen das als Welle: Berlin → deutsche Städte → europäische Städte → Welt
+
+  // Sortiere Hubs nach Distanz zu Berlin (näher = früher onboarded)
+  const berlinLat = 52.52, berlinLng = 13.405
+  const sortedHubs = CITY_HUBS.slice(1).map(hub => {
+    const dlat = hub.lat - berlinLat
+    const dlng = hub.lng - berlinLng
+    return { ...hub, distToBerlin: Math.sqrt(dlat * dlat + dlng * dlng) }
+  }).sort((a, b) => a.distToBerlin - b.distToBerlin)
+
+  // Jeder Hub-Pionier wurde vom nächstgelegenen bereits existierenden Pin onboarded
+  const hubPioneerIds: Map<string, number> = new Map()
+  hubPioneerIds.set('Berlin', 0) // Root
+
+  for (const hub of sortedHubs) {
+    // Finde den nächsten bereits existierenden Hub-Pionier als Parent
+    let bestParentId = 0
+    let bestDist = Infinity
+
+    for (const [, pioneerId] of hubPioneerIds) {
+      const parent = pins[pioneerId]
+      const dlat = hub.lat - parent.lat
+      const dlng = hub.lng - parent.lng
+      const dist = Math.sqrt(dlat * dlat + dlng * dlng)
+      if (dist < bestDist) {
+        bestDist = dist
+        bestParentId = pioneerId
+      }
+    }
+
+    const parentPin = pins[bestParentId]
+    const pioneerId = pins.length
+    pins.push({
+      id: pioneerId,
+      lat: hub.lat + (rng() - 0.5) * 0.1,
+      lng: hub.lng + (rng() - 0.5) * 0.1,
+      parentId: bestParentId,
+      depth: parentPin.depth + 1,
+      isRoot: false,
+    })
+    connections.push({ from: bestParentId, to: pioneerId })
+    hubPioneerIds.set(hub.name, pioneerId)
+  }
+
+  // Phase 2: Jeder Hub-Pionier onboarded lokale Leute
+  // Anzahl proportional zu population. Jeder lokale User onboarded
+  // weitere 0-3 Leute (wie ein echter viraler Spread).
+
+  for (const hub of [CITY_HUBS[0], ...sortedHubs]) {
+    const pioneerId = hubPioneerIds.get(hub.name)!
+    const localCount = Math.round(hub.population * 0.8 + rng() * hub.population * 0.4)
+
+    // Wave 1: Pionier onboarded direkt
+    const wave1Ids: number[] = []
+    const directOnboards = Math.min(localCount, 3 + Math.floor(rng() * 5))
+
+    for (let i = 0; i < directOnboards; i++) {
       const angle = rng() * 2 * Math.PI
-      const r = Math.sqrt(rng()) * zone.radiusKm * (0.5 + rng() * 0.5)
-
-      const lat = zone.lat + (r * Math.sin(angle)) / kmPerDegLat
-      const lng = zone.lng + (r * Math.cos(angle)) / kmPerDegLng
-
-      // "Mein Netzwerk": Punkte in Deutschland/Berlin-Nähe
-      const isMyNetwork = Math.abs(lat - 52.5) < 4 && Math.abs(lng - 13.4) < 5
-
-      nodes.push({
-        id: id++,
-        lat: Math.max(-85, Math.min(85, lat)),
-        lng: ((lng + 180) % 360) - 180,
-        weight: zone.weight * (0.75 + rng() * 0.25),
-        level: zone.level,
+      const r = rng() * 0.5 // ~50km Radius
+      const id = pins.length
+      pins.push({
+        id,
+        lat: hub.lat + Math.sin(angle) * r,
+        lng: hub.lng + Math.cos(angle) * r / Math.cos(hub.lat * Math.PI / 180),
+        parentId: pioneerId,
+        depth: pins[pioneerId].depth + 1,
         isRoot: false,
-        isMyNetwork,
-        parentId: null,
       })
-    }
-  }
-
-  // Root = "Ich" = Berlin Mitte
-  nodes[0] = {
-    id: 0, lat: 52.52, lng: 13.405,
-    weight: 1.0, level: 0,
-    isRoot: true, isMyNetwork: true, parentId: null,
-  }
-
-  cachedNodes = nodes
-  return nodes
-}
-
-function haversine(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371
-  const dLat = (lat2 - lat1) * Math.PI / 180
-  const dLng = (lng2 - lng1) * Math.PI / 180
-  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLng/2)**2
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a))
-}
-
-// ── Ältere API ───────────────────────────────────────────────
-export interface CityNode extends MycelNode {}
-export function getCityNodes() { return generateTrustNetwork() }
-export function getPersonNodes() { return [] }
-
-// ── Render-Hilfsfunktionen ───────────────────────────────────
-
-function drawGlowNode(
-  ctx: CanvasRenderingContext2D,
-  x: number, y: number,
-  radius: number,
-  alpha: number,
-  glowMult: number
-) {
-  // Großer Außen-Glow (blau-weiß, Biolumineszenz)
-  const glowR = radius * (3.0 + glowMult * 6)
-  const grd = ctx.createRadialGradient(x, y, radius * 0.2, x, y, glowR)
-  grd.addColorStop(0, `rgba(210,228,255,${alpha * glowMult * 0.45})`)
-  grd.addColorStop(0.4, `rgba(190,215,255,${alpha * glowMult * 0.18})`)
-  grd.addColorStop(1, `rgba(160,195,255,0)`)
-  ctx.beginPath()
-  ctx.arc(x, y, glowR, 0, Math.PI * 2)
-  ctx.fillStyle = grd
-  ctx.fill()
-
-  // Heller Kern (reinweiß)
-  const core = ctx.createRadialGradient(x, y, 0, x, y, radius)
-  core.addColorStop(0, `rgba(255,255,255,${alpha})`)
-  core.addColorStop(0.5, `rgba(230,242,255,${alpha * 0.92})`)
-  core.addColorStop(1, `rgba(190,215,255,${alpha * 0.5})`)
-  ctx.beginPath()
-  ctx.arc(x, y, radius, 0, Math.PI * 2)
-  ctx.fillStyle = core
-  ctx.fill()
-}
-
-function drawOrganicLine(
-  ctx: CanvasRenderingContext2D,
-  x1: number, y1: number,
-  x2: number, y2: number,
-  width: number, alpha: number,
-  rng: () => number
-) {
-  // Organische Kurve: Bézierkurve
-  const mx = (x1 + x2) / 2 + (rng() - 0.5) * Math.abs(x2 - x1) * 0.3
-  const my = (y1 + y2) / 2 + (rng() - 0.5) * Math.abs(y2 - y1) * 0.3
-
-  // Äußerer Glow
-  ctx.beginPath()
-  ctx.moveTo(x1, y1)
-  ctx.quadraticCurveTo(mx, my, x2, y2)
-  ctx.strokeStyle = `rgba(195,218,255,${alpha * 0.18})`
-  ctx.lineWidth = width * 4
-  ctx.lineCap = 'round'
-  ctx.stroke()
-
-  // Innere helle Linie (deutlicher als vorher)
-  ctx.beginPath()
-  ctx.moveTo(x1, y1)
-  ctx.quadraticCurveTo(mx, my, x2, y2)
-  ctx.strokeStyle = `rgba(240,248,255,${alpha * 0.80})`
-  ctx.lineWidth = width
-  ctx.lineCap = 'round'
-  ctx.stroke()
-}
-
-// ── Haupt-Overlay ────────────────────────────────────────────
-
-export class TrustNetworkOverlay extends L.Layer {
-  private canvas: HTMLCanvasElement | null = null
-  private nodes: MycelNode[]
-  mode: 'all' | 'my'
-  private _map: L.Map | null = null
-  private _animFrame: number | null = null
-  private _lineRng: () => number
-
-  constructor(_anyNodes: unknown, mode: 'all' | 'my') {
-    super()
-    this.nodes = generateTrustNetwork()
-    this.mode = mode
-    this._lineRng = seededRandom(99)
-  }
-
-  onAdd(map: L.Map): this {
-    this._map = map
-    const pane = map.getPane('overlayPane')!
-    this.canvas = L.DomUtil.create('canvas', 'myzel-canvas', pane) as HTMLCanvasElement
-    this.canvas.style.position = 'absolute'
-    this.canvas.style.pointerEvents = 'none'
-    this._resize()
-    this._scheduleRedraw()
-    map.on('moveend zoomend viewreset zoom', this._onMapChange, this)
-    return this
-  }
-
-  onRemove(map: L.Map): this {
-    map.off('moveend zoomend viewreset zoom', this._onMapChange, this)
-    if (this._animFrame) cancelAnimationFrame(this._animFrame)
-    if (this.canvas?.parentNode) this.canvas.parentNode.removeChild(this.canvas)
-    this.canvas = null
-    this._map = null
-    return this
-  }
-
-  setMode(mode: 'all' | 'my') {
-    this.mode = mode
-    this._scheduleRedraw()
-  }
-
-  private _onMapChange() {
-    this._resize()
-    this._scheduleRedraw()
-  }
-
-  private _scheduleRedraw() {
-    if (this._animFrame) cancelAnimationFrame(this._animFrame)
-    this._animFrame = requestAnimationFrame(() => this._draw())
-  }
-
-  private _resize() {
-    if (!this._map || !this.canvas) return
-    const size = this._map.getSize()
-    this.canvas.width = size.x
-    this.canvas.height = size.y
-    L.DomUtil.setPosition(this.canvas, this._map.containerPointToLayerPoint([0, 0]))
-  }
-
-  private _draw() {
-    if (!this._map || !this.canvas) return
-    const ctx = this.canvas.getContext('2d')
-    if (!ctx) return
-
-    const map = this._map
-    const zoom = map.getZoom()
-    const size = map.getSize()
-    ctx.clearRect(0, 0, size.x, size.y)
-
-    const bounds = map.getBounds().pad(0.3)
-
-    // ── Welche Level sichtbar ─────────────────────────────
-    // level 0: immer (Hauptzentren)
-    // level 1: ab zoom 2
-    // level 2: ab zoom 4
-    // level 3: ab zoom 7
-    const maxLevel = zoom < 2 ? 0 : zoom < 4 ? 1 : zoom < 7 ? 2 : 3
-
-    let visibleNodes = this.nodes.filter(n => n.level <= maxLevel)
-
-    if (this.mode === 'my') {
-      visibleNodes = visibleNodes.filter(n => n.isMyNetwork || n.isRoot)
+      connections.push({ from: pioneerId, to: id })
+      wave1Ids.push(id)
     }
 
-    // ── Zoom-Parameter ─────────────────────────────────────
-    // t=1.0 bei zoom=2 (weit raus): große, helle Punkte
-    // t=0.0 bei zoom=10 (nah rein): kleine, dezente Punkte
-    const t = Math.max(0, Math.min(1, (10 - zoom) / 8))
+    // Wave 2+: Kaskadierend — jeder onboarded 0-3 Leute
+    let currentWave = wave1Ids
+    let remaining = localCount - directOnboards
 
-    // Deutlicher sichtbar als vorher
-    const nodeBaseSize = 4 + t * 18         // 4–22px
-    const lineWidth    = 0.8 + t * 3.2      // 0.8–4px
-    const lineAlpha    = 0.40 + t * 0.55    // 0.4–0.95 (deutlicher!)
-    const glowMult     = 0.45 + t * 0.55    // 0.45–1.0
+    while (remaining > 0 && currentWave.length > 0) {
+      const nextWave: number[] = []
 
-    // RNG zurücksetzen für reproduzierbare Kurven
-    this._lineRng = seededRandom(99)
+      for (const parentId of currentWave) {
+        if (remaining <= 0) break
+        const onboards = Math.floor(rng() * 3.5) // 0-3 Leute
+        const parent = pins[parentId]
 
-    // ── Verbindungslinien ─────────────────────────────────
-    const visibleInView = visibleNodes.filter(n => bounds.contains([n.lat, n.lng]))
-
-    // Maximale Verbindungsdistanz je nach Zoom
-    const maxDistKm = zoom < 2 ? 10000 : zoom < 4 ? 4000 : zoom < 7 ? 1200 : 300
-
-    const drawnEdges = new Set<string>()
-
-    for (const node of visibleInView) {
-      const candidates = visibleNodes
-        .filter(n => n.id !== node.id)
-        .map(n => ({ n, d: haversine(node.lat, node.lng, n.lat, n.lng) }))
-        .filter(x => x.d < maxDistKm)
-        .sort((a, b) => a.d - b.d)
-        .slice(0, 4)
-
-      for (const { n: neighbor } of candidates) {
-        const edgeKey = [Math.min(node.id, neighbor.id), Math.max(node.id, neighbor.id)].join('-')
-        if (drawnEdges.has(edgeKey)) continue
-        drawnEdges.add(edgeKey)
-
-        const neighborInView = bounds.contains([neighbor.lat, neighbor.lng])
-        if (!neighborInView && !bounds.contains([node.lat, node.lng])) continue
-
-        const p1 = map.latLngToContainerPoint([node.lat, node.lng])
-        const p2 = map.latLngToContainerPoint([neighbor.lat, neighbor.lng])
-
-        const isMy = this.mode === 'my' && node.isMyNetwork && neighbor.isMyNetwork
-        drawOrganicLine(ctx, p1.x, p1.y, p2.x, p2.y,
-          isMy ? lineWidth * 2.0 : lineWidth,
-          isMy ? Math.min(1, lineAlpha * 1.6) : lineAlpha,
-          this._lineRng
-        )
+        for (let j = 0; j < onboards && remaining > 0; j++) {
+          const angle = rng() * 2 * Math.PI
+          const r = rng() * 0.3
+          const id = pins.length
+          pins.push({
+            id,
+            lat: parent.lat + Math.sin(angle) * r,
+            lng: parent.lng + Math.cos(angle) * r / Math.cos(parent.lat * Math.PI / 180),
+            parentId: parentId,
+            depth: parent.depth + 1,
+            isRoot: false,
+          })
+          connections.push({ from: parentId, to: id })
+          nextWave.push(id)
+          remaining--
+        }
       }
+
+      currentWave = nextWave
     }
+  }
 
-    // ── Knoten ─────────────────────────────────────────────
-    for (const node of visibleNodes) {
-      if (!bounds.contains([node.lat, node.lng])) continue
+  cachedPins = pins
+  cachedConnections = connections
+  return { pins, connections }
+}
 
-      const p = map.latLngToContainerPoint([node.lat, node.lng])
-      const sizeNode = nodeBaseSize * (0.45 + node.weight * 0.55)
-      const alpha = 0.75 + node.weight * 0.25
+// ── Grid-basiertes Clustering ────────────────────────────────
 
-      if (node.isRoot) {
-        // "Ich" — Gold, extra hell
-        const g = ctx.createRadialGradient(p.x, p.y, 0, p.x, p.y, sizeNode * 4)
-        g.addColorStop(0, `rgba(255,220,100,0.6)`)
-        g.addColorStop(1, `rgba(255,180,50,0)`)
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, sizeNode * 4, 0, Math.PI * 2)
-        ctx.fillStyle = g
-        ctx.fill()
+export function clusterPins(pins: TrustPin[], cellSize: number = 5): ClusterNode[] {
+  const grid = new Map<string, ClusterNode>()
 
-        drawGlowNode(ctx, p.x, p.y, sizeNode * 1.5, 1.0, 1.0)
-        ctx.beginPath()
-        ctx.arc(p.x, p.y, sizeNode * 0.6, 0, Math.PI * 2)
-        ctx.fillStyle = 'rgba(255,200,80,1)'
-        ctx.fill()
-      } else {
-        drawGlowNode(ctx, p.x, p.y, sizeNode, alpha, glowMult * (0.5 + node.weight * 0.5))
+  for (const pin of pins) {
+    const key = `${Math.floor(pin.lat / cellSize)}_${Math.floor(pin.lng / cellSize)}`
+    let cluster = grid.get(key)
+    if (!cluster) {
+      cluster = { id: key, lat: 0, lng: 0, count: 0, isRoot: false, pinIds: [] }
+      grid.set(key, cluster)
+    }
+    cluster.lat += pin.lat
+    cluster.lng += pin.lng
+    cluster.count++
+    cluster.pinIds.push(pin.id)
+    if (pin.isRoot) cluster.isRoot = true
+  }
+
+  // Durchschnitt berechnen
+  for (const cluster of grid.values()) {
+    cluster.lat /= cluster.count
+    cluster.lng /= cluster.count
+  }
+
+  return Array.from(grid.values())
+}
+
+// ── Echte Verbindungs-Arcs zwischen Clustern ─────────────────
+// Zählt wie viele ECHTE Parent→Child Verbindungen zwischen zwei
+// Clustern existieren. Das ist der Schlüssel: Keine Fake-Arcs.
+
+export function generateRealArcs(
+  _pins: TrustPin[],
+  connections: { from: number; to: number }[],
+  clusters: ClusterNode[]
+): ArcLink[] {
+  // Lookup: pinId → clusterId
+  const pinToCluster = new Map<number, string>()
+  for (const cluster of clusters) {
+    for (const pinId of cluster.pinIds) {
+      pinToCluster.set(pinId, cluster.id)
+    }
+  }
+
+  // Cluster-Lookup für Positionen
+  const clusterMap = new Map<string, ClusterNode>()
+  for (const c of clusters) clusterMap.set(c.id, c)
+
+  // Zähle Verbindungen zwischen verschiedenen Clustern
+  const arcCounts = new Map<string, number>()
+
+  for (const conn of connections) {
+    const fromCluster = pinToCluster.get(conn.from)
+    const toCluster = pinToCluster.get(conn.to)
+    if (!fromCluster || !toCluster) continue
+    if (fromCluster === toCluster) continue // Intra-Cluster → kein Arc
+
+    // Normalisierte Key (damit A→B und B→A zusammengezählt werden)
+    const arcKey = fromCluster < toCluster
+      ? `${fromCluster}|${toCluster}`
+      : `${toCluster}|${fromCluster}`
+
+    arcCounts.set(arcKey, (arcCounts.get(arcKey) || 0) + 1)
+  }
+
+  // In ArcLinks umwandeln
+  const arcs: ArcLink[] = []
+  for (const [key, strength] of arcCounts) {
+    const [c1Key, c2Key] = key.split('|')
+    const c1 = clusterMap.get(c1Key)
+    const c2 = clusterMap.get(c2Key)
+    if (!c1 || !c2) continue
+
+    arcs.push({
+      startLat: c1.lat,
+      startLng: c1.lng,
+      endLat: c2.lat,
+      endLng: c2.lng,
+      strength,
+    })
+  }
+
+  return arcs
+}
+
+// ── Leaflet MarkerCluster Overlay ─────────────────────────────
+// Echte anklickbare Pins mit MarkerClusterGroup + Canvas-Myzel
+
+import L from 'leaflet'
+import 'leaflet.markercluster'
+
+// Pin-Icons
+const PIN_ICON = L.divIcon({
+  className: 'trust-pin',
+  html: '<div style="width:10px;height:10px;border-radius:50%;background:radial-gradient(circle,rgba(139,92,246,0.9),rgba(109,62,216,1));border:1.5px solid rgba(255,255,255,0.6);box-shadow:0 0 6px rgba(139,92,246,0.5);transition:transform 0.2s"></div>',
+  iconSize: [10, 10],
+  iconAnchor: [5, 5],
+})
+
+const ROOT_ICON = L.divIcon({
+  className: 'trust-pin-root',
+  html: '<div style="width:16px;height:16px;border-radius:50%;background:radial-gradient(circle,rgba(251,191,36,0.95),rgba(245,158,11,1));border:2px solid rgba(255,255,255,0.8);box-shadow:0 0 12px rgba(251,191,36,0.6);transition:transform 0.2s"></div>',
+  iconSize: [16, 16],
+  iconAnchor: [8, 8],
+})
+
+/**
+ * Erstellt ein MarkerClusterGroup-Overlay mit ECHTEN anklickbaren Pins
+ * und zeichnet Myzel-Verbindungen zwischen sichtbaren Clustern.
+ */
+export function createTrustOverlay(map: L.Map): {
+  clusterGroup: L.MarkerClusterGroup
+  canvasLayer: L.Layer
+  remove: () => void
+} {
+  const { pins, connections } = generateTrustNetwork()
+
+  // ── MarkerClusterGroup mit Custom-Styling ──
+  const clusterGroup = L.markerClusterGroup({
+    maxClusterRadius: 45,
+    spiderfyOnMaxZoom: true,
+    showCoverageOnHover: false,
+    zoomToBoundsOnClick: true,
+    iconCreateFunction: (cluster) => {
+      const count = cluster.getChildCount()
+      let sizeClass = 'trust-cluster-small'
+      let size = 30
+      if (count > 50) { sizeClass = 'trust-cluster-large'; size = 44 }
+      else if (count > 10) { sizeClass = 'trust-cluster-medium'; size = 36 }
+      return L.divIcon({
+        html: `<div class="trust-cluster ${sizeClass}"><span>${count}</span></div>`,
+        className: '',
+        iconSize: L.point(size, size),
+      })
+    },
+  })
+
+  // ── Echte Marker erstellen ──
+  const pinMap = new Map<number, TrustPin>()
+  for (const pin of pins) pinMap.set(pin.id, pin)
+
+  for (const pin of pins) {
+    const marker = L.marker([pin.lat, pin.lng], {
+      icon: pin.isRoot ? ROOT_ICON : PIN_ICON,
+    })
+
+    // Popup mit echten Profil-Infos
+    const parent = pin.parentId !== null ? pinMap.get(pin.parentId) : null
+    const children = connections.filter(c => c.from === pin.id).length
+    marker.bindPopup(`
+      <div style="min-width:160px;font-family:system-ui,sans-serif">
+        <div style="font-weight:700;font-size:14px;margin-bottom:4px">
+          ${pin.isRoot ? '⭐ Root Node' : `👤 User #${pin.id}`}
+        </div>
+        <div style="font-size:12px;color:#6b7280;line-height:1.6">
+          📍 ${pin.lat.toFixed(3)}, ${pin.lng.toFixed(3)}<br/>
+          🔗 Tiefe: ${pin.depth} ${pin.depth === 0 ? '(Ursprung)' : ''}<br/>
+          ${parent ? `⬆️ Onboarded von: User #${parent.id}<br/>` : ''}
+          ⬇️ Hat ${children} onboarded
+        </div>
+      </div>
+    `, { className: 'trust-popup' })
+
+    clusterGroup.addLayer(marker)
+  }
+
+  clusterGroup.addTo(map)
+
+  // ── Canvas-Layer für Myzel-Verbindungen ──
+  const MycelCanvas = L.Layer.extend({
+    onAdd(m: L.Map) {
+      this._map = m
+      this._canvas = L.DomUtil.create('canvas', 'mycel-canvas') as HTMLCanvasElement
+      const pane = m.getPane('overlayPane')!
+      pane.appendChild(this._canvas)
+      this._canvas.style.position = 'absolute'
+      this._canvas.style.pointerEvents = 'none'
+      this._canvas.style.zIndex = '250'
+
+      this._onMove = () => this._draw()
+      m.on('moveend zoomend resize', this._onMove)
+      // Cluster-Animation fertig → neu zeichnen
+      clusterGroup.on('animationend', this._onMove)
+      this._draw()
+      return this
+    },
+
+    onRemove(m: L.Map) {
+      m.off('moveend zoomend resize', this._onMove)
+      clusterGroup.off('animationend', this._onMove)
+      if (this._canvas && this._canvas.parentNode) {
+        this._canvas.parentNode.removeChild(this._canvas)
       }
-    }
+      return this
+    },
+
+    _draw() {
+      const m = this._map as L.Map
+      if (!m) return
+      const canvas = this._canvas as HTMLCanvasElement
+      const size = m.getSize()
+      const topLeft = m.containerPointToLayerPoint([0, 0])
+
+      canvas.width = size.x
+      canvas.height = size.y
+      L.DomUtil.setPosition(canvas, topLeft)
+
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      ctx.clearRect(0, 0, size.x, size.y)
+
+      // Sichtbare Cluster-Positionen sammeln
+      const visibleClusters: { center: L.Point; count: number; pinIds: number[] }[] = []
+
+      // Durch alle sichtbaren Cluster iterieren
+      // @ts-expect-error _featureGroup is internal Leaflet API
+      const featureGroup = clusterGroup._featureGroup
+      if (!featureGroup) return
+
+      featureGroup.eachLayer((layer: any) => {
+        if (!m.getBounds().contains(layer.getLatLng())) return
+
+        if (layer._childCount) {
+          // Es ist ein Cluster
+          const pt = m.latLngToContainerPoint(layer.getLatLng())
+          const childMarkers = layer.getAllChildMarkers()
+          const pIds = childMarkers.map((_: any, i: number) => i)
+          visibleClusters.push({ center: pt, count: layer._childCount, pinIds: pIds })
+        }
+      })
+
+      if (visibleClusters.length < 2) return
+
+      // Verbindungen zwischen nahegelegenen Clustern zeichnen
+      // Nutze die echten Connections-Daten
+      const connLookup = new Map<string, number>()
+      for (const conn of connections) {
+        const key = `${conn.from}-${conn.to}`
+        connLookup.set(key, (connLookup.get(key) || 0) + 1)
+      }
+
+      for (let i = 0; i < visibleClusters.length; i++) {
+        for (let j = i + 1; j < visibleClusters.length; j++) {
+          const a = visibleClusters[i]
+          const b = visibleClusters[j]
+          const dx = a.center.x - b.center.x
+          const dy = a.center.y - b.center.y
+          const dist = Math.sqrt(dx * dx + dy * dy)
+
+          // Nur verbinden wenn nicht zu weit auseinander auf dem Bildschirm
+          if (dist > 500) continue
+
+          // Stärke basierend auf Cluster-Größen
+          const strength = Math.min(a.count, b.count)
+          const alpha = Math.min(0.08 + strength * 0.003, 0.35)
+          const width = 1 + Math.sqrt(strength) * 0.4
+
+          // Organische Kurve (Myzel-Look)
+          ctx.beginPath()
+          ctx.strokeStyle = `rgba(139, 92, 246, ${alpha})`
+          ctx.lineWidth = width
+          ctx.setLineDash([])
+
+          // Leicht gebogene Linie
+          const midX = (a.center.x + b.center.x) / 2
+          const midY = (a.center.y + b.center.y) / 2
+          const offset = dist * 0.1 * (i % 2 === 0 ? 1 : -1)
+          const cpX = midX + (dy / dist) * offset
+          const cpY = midY - (dx / dist) * offset
+
+          ctx.moveTo(a.center.x, a.center.y)
+          ctx.quadraticCurveTo(cpX, cpY, b.center.x, b.center.y)
+          ctx.stroke()
+        }
+      }
+    },
+  })
+
+  const canvasLayer = new MycelCanvas()
+  canvasLayer.addTo(map)
+
+  return {
+    clusterGroup,
+    canvasLayer,
+    remove: () => {
+      map.removeLayer(clusterGroup)
+      map.removeLayer(canvasLayer)
+    },
   }
 }

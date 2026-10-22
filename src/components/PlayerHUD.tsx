@@ -551,7 +551,11 @@ function LogPanel() {
 // ============================================================
 
 // ModuleId muss mit AppClean übereinstimmen
-type ModuleId = 'profil' | 'kalender' | 'feed' | 'marktplatz' | 'quest' | 'wertschoepfung' | 'wallet' | 'skills' | 'avatar' | 'log'
+type ModuleId =
+  | 'profil' | 'kalender' | 'marktplatz' | 'wertschoepfung' | 'quest'
+  | 'avatar' | 'skilltree' | 'log' | 'feed'
+  | 'entscheidung' | 'wissensdatenbank' | 'eli' | 'health' | 'notifications'
+  | 'wallet'
 
 interface HudButton {
   id: NonNullable<ActivePanel>
@@ -597,8 +601,8 @@ export function PlayerHUD({ onOpenModule }: PlayerHUDProps) {
     },
     {
       id: 'skills',
-      moduleId: 'skills',
-      label: 'Fähigkeiten',
+      moduleId: 'skilltree',
+      label: 'Skill-Tree',
       color: '#667eea',
       icon: (
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
